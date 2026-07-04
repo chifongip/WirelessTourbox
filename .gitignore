@@ -1,0 +1,21 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code
+.vscode/
+
+# Go build artifacts
+gui/wireless-tourbox-config
+gui/wireless-tourbox-config.exe
+gui/wireless-tourbox-config-mac
+gui/wireless-tourbox-config-mac-arm64
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+**/__pycache__/
+*.pyc
