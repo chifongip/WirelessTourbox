@@ -118,17 +118,19 @@ wireless-tourbox-config.exe      # Windows
 **Features:**
 - Connect to device via serial port dropdown
 - View all 10 inputs with current key mappings
-- Click "Change" to remap any input via live key capture
-- Duplicate key detection
+- Click "Edit" to choose or capture a mapping
+- Categorized key picker plus optional live key capture
+- Duplicate mapping warnings (duplicates can be confirmed)
+- Responsive mapping layout with native window maximize support
 - Reset all keys to defaults (F13-F22)
-- Live monitor showing input events in real-time
+- Fixed-height live monitor showing input events in real time
 
 **Supported key combinations:**
 - Single keys: A-Z, 0-9, F1-F24, symbols (`,./;'[]\-=`)
 - Shift+key: Shift+A, Shift+F1, etc.
 - Ctrl+key: Ctrl+C, Ctrl+Z, Ctrl+A, etc.
 - Alt+key: Alt+A, Alt+F1, etc.
-- Note: Windows/Super key is not supported (triggers OS events first)
+- Windows/Super mappings are available through the modifier picker even when the OS intercepts live capture
 
 **Build from source:**
 ```bash
@@ -196,6 +198,8 @@ The device exposes a CDC serial interface for runtime configuration:
 |---------|----------|-------------|
 | `GET_LAYOUT` | `mod:key,mod:key,...` | Returns current 10 key mappings (decimal) |
 | `SET_KEY:[idx]:[mod]:[key]` | `OK` or `ERR` | Updates key at index, persists to EEPROM |
+| `GET_INFO` | `INFO:WirelessTourbox:1` | Identifies the device and protocol version |
+| `RESET_DEFAULTS` | `OK` | Atomically restores F13–F22 defaults |
 
 **Example:**
 ```
@@ -231,6 +235,7 @@ Most creative apps let you bind custom keyboard shortcuts — just press the Tou
 WirelessTourbox/
 ├── src/
 │   └── main.cpp          # Firmware (HID + CDC + EEPROM + inputs)
+├── lib/TourboxCore/      # Host-testable debounce and HID report logic
 ├── gui/
 │   ├── main.go           # GUI entry point (Go + Fyne)
 │   ├── device.go         # Serial communication
@@ -240,6 +245,7 @@ WirelessTourbox/
 │   └── go.sum
 ├── config_tool.py        # Python terminal config tool
 ├── test_hardware.py      # Hardware test script
+├── test/test_core/       # Native PlatformIO unit tests
 ├── platformio.ini        # Build configuration
 ├── CLAUDE.md             # Developer guide
 ├── NOTES.md              # Design spec

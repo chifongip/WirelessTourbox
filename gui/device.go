@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,18 +12,16 @@ import (
 )
 
 const (
-	baudRate    = 115200
-	numInputs   = 10
-	readTimeout = 500 * time.Millisecond
+	baudRate       = 115200
+	numInputs      = 10
+	commandTimeout = 3 * time.Second
 )
 
-// PortInfo holds information about a serial port.
 type PortInfo struct {
 	Name        string
 	Description string
 }
 
-// KeyEvent represents an input event from the device.
 type KeyEvent struct {
 	Index    int
 	Modifier uint8
@@ -30,273 +29,387 @@ type KeyEvent struct {
 	Action   string
 }
 
-// Device represents a connected WirelessTourbox device.
-type Device struct {
-	port       serial.Port
-	connected  bool
-	layout     [numInputs][2]uint8
-	portName   string
-	mu         sync.Mutex
-	respCh     chan string
-	eventCh    chan KeyEvent
-	stopReadCh chan struct{}
+type serialPort interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	Close() error
+	SetReadTimeout(time.Duration) error
 }
 
-// ListPorts returns available serial ports.
+var openSerialPort = func(name string, mode *serial.Mode) (serialPort, error) {
+	return serial.Open(name, mode)
+}
+
+type deviceSession struct {
+	port     serialPort
+	respCh   chan string
+	eventCh  chan KeyEvent
+	errCh    chan error
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	doneCh   chan struct{}
+}
+
+func (s *deviceSession) stop() {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		_ = s.port.Close()
+	})
+	<-s.doneCh
+}
+
+type Device struct {
+	mu              sync.RWMutex
+	commandMu       sync.Mutex
+	session         *deviceSession
+	layout          [numInputs][2]uint8
+	portName        string
+	protocolVersion int
+}
+
 func ListPorts() ([]PortInfo, error) {
 	ports, err := serial.GetPortsList()
 	if err != nil {
 		return nil, err
 	}
-	var result []PortInfo
-	for _, p := range ports {
-		info := PortInfo{Name: p, Description: p}
-		if strings.Contains(p, "ACM") || strings.Contains(p, "COM") {
-			info.Description = p + " (Serial)"
+	result := make([]PortInfo, 0, len(ports))
+	for _, port := range ports {
+		description := port
+		upper := strings.ToUpper(port)
+		if strings.Contains(upper, "ACM") || strings.Contains(upper, "COM") {
+			description += " (likely USB serial)"
 		}
-		result = append(result, info)
+		result = append(result, PortInfo{Name: port, Description: description})
 	}
 	return result, nil
 }
 
-// Connect opens a serial connection to the device.
 func (d *Device) Connect(portName string) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.connected {
-		d.disconnectLocked()
-	}
-	mode := &serial.Mode{BaudRate: baudRate}
-	port, err := serial.Open(portName, mode)
+	d.Disconnect()
+	port, err := openSerialPort(portName, &serial.Mode{BaudRate: baudRate})
 	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", portName, err)
+		return fmt.Errorf("open %s: %w", portName, err)
 	}
-	port.SetReadTimeout(readTimeout)
-	d.port = port
-	d.connected = true
+	if err := port.SetReadTimeout(250 * time.Millisecond); err != nil {
+		_ = port.Close()
+		return fmt.Errorf("configure %s: %w", portName, err)
+	}
+	session := &deviceSession{
+		port: port, respCh: make(chan string, 8), eventCh: make(chan KeyEvent, 100),
+		errCh: make(chan error, 1), stopCh: make(chan struct{}), doneCh: make(chan struct{}),
+	}
+	d.mu.Lock()
+	d.session = session
 	d.portName = portName
-	d.respCh = make(chan string, 1)
-	d.eventCh = make(chan KeyEvent, 100)
-	d.stopReadCh = make(chan struct{})
-
-	// Drain startup message
-	time.Sleep(500 * time.Millisecond)
-	buf := make([]byte, 256)
-	for {
-		n, _ := port.Read(buf)
-		if n == 0 {
-			break
-		}
-	}
-
-	go d.readLoop()
+	d.protocolVersion = 0
+	d.mu.Unlock()
+	go d.readLoop(session)
 	return nil
 }
 
-// Disconnect closes the serial connection.
 func (d *Device) Disconnect() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.disconnectLocked()
-}
-
-func (d *Device) disconnectLocked() error {
-	if d.port != nil {
-		close(d.stopReadCh)
-		err := d.port.Close()
-		d.port = nil
-		d.connected = false
-		// Close event channel so monitor goroutine exits
-		close(d.eventCh)
-		return err
+	session := d.session
+	d.session = nil
+	d.protocolVersion = 0
+	d.mu.Unlock()
+	if session == nil {
+		return nil
 	}
+	session.stop()
 	return nil
 }
 
-// IsConnected returns whether the device is connected.
 func (d *Device) IsConnected() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.connected
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.session != nil
 }
 
-// PortName returns the connected port name.
 func (d *Device) PortName() string {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return d.portName
 }
 
-// EventChan returns the channel for KEY events.
-func (d *Device) EventChan() <-chan KeyEvent {
-	return d.eventCh
+func (d *Device) ProtocolVersion() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.protocolVersion
 }
 
-// readLoop reads all lines from the serial port and routes them.
-func (d *Device) readLoop() {
+func (d *Device) EventChan() <-chan KeyEvent {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.session == nil {
+		return nil
+	}
+	return d.session.eventCh
+}
+
+func (d *Device) ErrorChan() <-chan error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.session == nil {
+		return nil
+	}
+	return d.session.errCh
+}
+
+func (d *Device) readLoop(session *deviceSession) {
+	defer close(session.doneCh)
+	defer close(session.eventCh)
+	defer close(session.errCh)
+	buffer := make([]byte, 256)
+	pending := make([]byte, 0, 256)
 	for {
+		n, err := session.port.Read(buffer)
+		if n > 0 {
+			pending = append(pending, buffer[:n]...)
+			for {
+				newline := bytes.IndexByte(pending, '\n')
+				if newline < 0 {
+					break
+				}
+				d.routeLine(session, strings.TrimSpace(string(pending[:newline])))
+				pending = pending[newline+1:]
+			}
+			if len(pending) > 4096 {
+				pending = pending[:0]
+			}
+		}
+		if err != nil {
+			select {
+			case <-session.stopCh:
+				return
+			default:
+			}
+			d.mu.Lock()
+			if d.session == session {
+				d.session = nil
+			}
+			d.mu.Unlock()
+			select {
+			case session.errCh <- fmt.Errorf("serial connection lost: %w", err):
+			default:
+			}
+			_ = session.port.Close()
+			return
+		}
 		select {
-		case <-d.stopReadCh:
+		case <-session.stopCh:
 			return
 		default:
 		}
-		line, err := d.readLine()
-		if err != nil {
-			if !d.connected {
-				return
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "KEY:") {
-			evt := parseKeyEvent(line)
-			if evt != nil {
-				select {
-				case d.eventCh <- *evt:
-				default:
-				}
-			}
-		} else {
-			select {
-			case d.respCh <- line:
-			default:
-			}
-		}
 	}
 }
 
-// readLine reads a single line from the serial port.
-func (d *Device) readLine() (string, error) {
-	var line []byte
-	buf := make([]byte, 1)
-	for {
-		n, err := d.port.Read(buf)
-		if n > 0 {
-			if buf[0] == '\n' || buf[0] == '\r' {
-				if len(line) > 0 {
-					return string(line), nil
-				}
-				continue
-			}
-			line = append(line, buf[0])
+func (d *Device) routeLine(session *deviceSession, line string) {
+	if line == "" {
+		return
+	}
+	if event := parseKeyEvent(line); event != nil {
+		select {
+		case session.eventCh <- *event:
+		default:
 		}
-		if err != nil {
-			if len(line) > 0 {
-				return string(line), err
-			}
-			return "", err
-		}
+		return
+	}
+	select {
+	case session.respCh <- line:
+	default:
 	}
 }
 
-// parseKeyEvent parses a KEY:<index>:0x<mod>:0x<key> line.
 func parseKeyEvent(line string) *KeyEvent {
+	if !strings.HasPrefix(line, "KEY:") {
+		return nil
+	}
 	parts := strings.Split(line, ":")
 	if len(parts) != 4 {
 		return nil
 	}
-	idx, err := strconv.Atoi(parts[1])
-	if err != nil || idx < 0 || idx >= numInputs {
+	index, err := strconv.Atoi(parts[1])
+	if err != nil || index < 0 || index >= numInputs {
 		return nil
 	}
-	mod, err := strconv.ParseUint(strings.TrimPrefix(parts[2], "0x"), 16, 8)
+	modifier, err := strconv.ParseUint(strings.TrimPrefix(parts[2], "0x"), 16, 8)
 	if err != nil {
 		return nil
 	}
-	key, err := strconv.ParseUint(strings.TrimPrefix(parts[3], "0x"), 16, 8)
+	keycode, err := strconv.ParseUint(strings.TrimPrefix(parts[3], "0x"), 16, 8)
 	if err != nil {
 		return nil
 	}
-	return &KeyEvent{Index: idx, Modifier: uint8(mod), Keycode: uint8(key), Action: "pressed"}
+	return &KeyEvent{Index: index, Modifier: uint8(modifier), Keycode: uint8(keycode), Action: "pressed"}
 }
 
-// sendCommand sends a command and waits for the response.
-func (d *Device) sendCommand(cmd string) (string, error) {
-	d.mu.Lock()
-	if !d.connected {
-		d.mu.Unlock()
+func responseMatches(command, response string) bool {
+	if strings.HasPrefix(response, "ERR:") {
+		return true
+	}
+	switch {
+	case command == "GET_INFO":
+		return strings.HasPrefix(response, "INFO:")
+	case command == "GET_LAYOUT":
+		return strings.Count(response, ",") == numInputs-1
+	case command == "RESET_DEFAULTS", strings.HasPrefix(command, "SET_KEY:"):
+		return response == "OK"
+	default:
+		return true
+	}
+}
+
+func (d *Device) sendCommand(command string) (string, error) {
+	d.commandMu.Lock()
+	defer d.commandMu.Unlock()
+	d.mu.RLock()
+	session := d.session
+	d.mu.RUnlock()
+	if session == nil {
 		return "", fmt.Errorf("not connected")
 	}
-	// Drain any stale response from a previous timeout
-	select {
-	case <-d.respCh:
-	default:
+	for {
+		select {
+		case <-session.respCh:
+		default:
+			goto drained
+		}
 	}
-	_, err := d.port.Write([]byte(cmd + "\n"))
-	d.mu.Unlock()
-	if err != nil {
-		return "", fmt.Errorf("write error: %w", err)
+
+drained:
+	if _, err := session.port.Write([]byte(command + "\n")); err != nil {
+		return "", fmt.Errorf("write command: %w", err)
 	}
-	select {
-	case resp := <-d.respCh:
-		return resp, nil
-	case <-time.After(3 * time.Second):
-		return "", fmt.Errorf("timeout waiting for response")
+	timer := time.NewTimer(commandTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case response := <-session.respCh:
+			if responseMatches(command, response) {
+				return response, nil
+			}
+		case <-session.doneCh:
+			return "", fmt.Errorf("device disconnected")
+		case <-timer.C:
+			return "", fmt.Errorf("timeout waiting for %s response", strings.Split(command, ":")[0])
+		}
 	}
 }
 
-// GetLayout reads the current key layout from the device.
-func (d *Device) GetLayout() error {
-	resp, err := d.sendCommand("GET_LAYOUT")
+func (d *Device) Identify() error {
+	response, err := d.sendCommand("GET_INFO")
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(resp, "ERR") {
-		return fmt.Errorf("device error: %s", resp)
+	version := 0
+	if response == "ERR:UNKNOWN" {
+		// Firmware before protocol versioning is accepted after layout validation.
+	} else {
+		parts := strings.Split(response, ":")
+		if len(parts) != 3 || parts[0] != "INFO" || parts[1] != "WirelessTourbox" {
+			return fmt.Errorf("selected port is not a WirelessTourbox")
+		}
+		version, err = strconv.Atoi(parts[2])
+		if err != nil || version < 1 {
+			return fmt.Errorf("unsupported protocol response: %s", response)
+		}
 	}
-	pairs := strings.Split(resp, ",")
+	d.mu.Lock()
+	d.protocolVersion = version
+	d.mu.Unlock()
+	return nil
+}
+
+func parseLayout(response string) ([numInputs][2]uint8, error) {
+	var layout [numInputs][2]uint8
+	pairs := strings.Split(response, ",")
 	if len(pairs) != numInputs {
-		return fmt.Errorf("expected %d pairs, got %d", numInputs, len(pairs))
+		return layout, fmt.Errorf("expected %d mappings, got %d", numInputs, len(pairs))
 	}
 	for i, pair := range pairs {
 		parts := strings.Split(pair, ":")
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid pair format: %s", pair)
+			return layout, fmt.Errorf("invalid mapping %q", pair)
 		}
-		mod, _ := strconv.Atoi(parts[0])
-		key, _ := strconv.Atoi(parts[1])
-		d.layout[i][0] = uint8(mod)
-		d.layout[i][1] = uint8(key)
+		modifier, err := strconv.ParseUint(parts[0], 10, 8)
+		if err != nil {
+			return layout, fmt.Errorf("invalid modifier in mapping %d", i)
+		}
+		keycode, err := strconv.ParseUint(parts[1], 10, 8)
+		if err != nil {
+			return layout, fmt.Errorf("invalid keycode in mapping %d", i)
+		}
+		layout[i] = [2]uint8{uint8(modifier), uint8(keycode)}
 	}
-	return nil
+	return layout, nil
 }
 
-// SetKey sends a SET_KEY command to remap an input.
-func (d *Device) SetKey(index int, mod, keycode uint8) error {
-	if index < 0 || index >= numInputs {
-		return fmt.Errorf("invalid index: %d", index)
-	}
-	cmd := fmt.Sprintf("SET_KEY:%d:%d:%d", index, mod, keycode)
-	resp, err := d.sendCommand(cmd)
+func (d *Device) GetLayout() error {
+	response, err := d.sendCommand("GET_LAYOUT")
 	if err != nil {
 		return err
 	}
-	if resp != "OK" {
-		return fmt.Errorf("device rejected: %s", resp)
+	if strings.HasPrefix(response, "ERR:") {
+		return fmt.Errorf("device error: %s", response)
 	}
-	d.layout[index][0] = mod
-	d.layout[index][1] = keycode
+	layout, err := parseLayout(response)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.layout = layout
+	d.mu.Unlock()
 	return nil
 }
 
-// ResetDefaults sends SET_KEY commands for all default mappings.
-func (d *Device) ResetDefaults() error {
-	defaults := [numInputs][2]uint8{
-		{0x00, 0x68}, {0x00, 0x69}, {0x00, 0x6A}, {0x00, 0x6B},
-		{0x00, 0x6C}, {0x00, 0x6D}, {0x00, 0x6E}, {0x00, 0x6F},
-		{0x00, 0x70}, {0x00, 0x71},
+func (d *Device) SetKey(index int, modifier, keycode uint8) error {
+	if index < 0 || index >= numInputs {
+		return fmt.Errorf("invalid index: %d", index)
 	}
-	for i := 0; i < numInputs; i++ {
-		if err := d.SetKey(i, defaults[i][0], defaults[i][1]); err != nil {
-			return fmt.Errorf("failed to reset input %d: %w", i, err)
+	response, err := d.sendCommand(fmt.Sprintf("SET_KEY:%d:%d:%d", index, modifier, keycode))
+	if err != nil {
+		return err
+	}
+	if response != "OK" {
+		return fmt.Errorf("device rejected mapping: %s", response)
+	}
+	d.mu.Lock()
+	d.layout[index] = [2]uint8{modifier, keycode}
+	d.mu.Unlock()
+	return nil
+}
+
+var defaultLayout = [numInputs][2]uint8{
+	{0x00, 0x68}, {0x00, 0x69}, {0x00, 0x6A}, {0x00, 0x6B},
+	{0x00, 0x6C}, {0x00, 0x6D}, {0x00, 0x6E}, {0x00, 0x6F},
+	{0x00, 0x70}, {0x00, 0x71},
+}
+
+func (d *Device) ResetDefaults() error {
+	if d.ProtocolVersion() >= 1 {
+		response, err := d.sendCommand("RESET_DEFAULTS")
+		if err != nil {
+			return err
+		}
+		if response != "OK" {
+			return fmt.Errorf("device rejected reset: %s", response)
+		}
+		d.mu.Lock()
+		d.layout = defaultLayout
+		d.mu.Unlock()
+		return nil
+	}
+	for i, mapping := range defaultLayout {
+		if err := d.SetKey(i, mapping[0], mapping[1]); err != nil {
+			return fmt.Errorf("reset input %d: %w", i, err)
 		}
 	}
 	return nil
 }
 
-// GetLayoutData returns the current layout.
 func (d *Device) GetLayoutData() [numInputs][2]uint8 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return d.layout
 }

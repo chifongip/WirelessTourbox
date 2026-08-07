@@ -56,6 +56,8 @@ Each input is 2 bytes: [modifier, keycode]. Default mappings use no modifier (0x
 ### Serial Command Spec
 - `GET_LAYOUT` → Returns `mod:key,mod:key,...` (10 pairs, decimal, comma-separated).
 - `SET_KEY:[index]:[modifier]:[keycode]` → Updates modifier and keycode at index, commits to EEPROM, responds `OK`.
+- `GET_INFO` → Returns `INFO:WirelessTourbox:1` for identity and protocol negotiation.
+- `RESET_DEFAULTS` → Restores all defaults with one EEPROM commit and responds `OK`.
 
 ### Debug Output
 When a key is sent, the firmware echoes: `KEY:<index>:0x<modifier_hex>:0x<keycode_hex>`
@@ -72,9 +74,10 @@ When a key is sent, the firmware echoes: `KEY:<index>:0x<modifier_hex>:0x<keycod
 ### GUI Config Tool (Go + Fyne)
 - Cross-platform native desktop application (Windows, macOS, Linux)
 - Live key capture for remapping
-- Duplicate key detection
-- Real-time input monitor
-- Single-reader serial architecture (prevents race conditions between monitor and commands)
+- Duplicate mapping confirmation
+- Categorized key picker with all left/right modifiers
+- Fixed-height real-time input monitor
+- Single-reader serial architecture that separates command responses from `KEY:` debug events
 
 ### Key Capture Implementation (Fyne)
 The key capture widget uses three methods to handle different key types:
@@ -84,7 +87,7 @@ The key capture widget uses three methods to handle different key types:
 
 Fyne's built-in shortcuts (Ctrl+C, Ctrl+V, Ctrl+Z, etc.) are reverse-mapped via the `builtinShortcuts` table in `ui.go`.
 
-Super/Windows key is not supported — it triggers OS events before reaching the application.
+Super/Windows may be intercepted during live capture, so the picker provides it explicitly.
 
 ### Terminal Config Tool (Python)
 - `config_tool.py` — Terminal UI with key capture

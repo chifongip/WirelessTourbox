@@ -1,0 +1,33 @@
+name: Build and Test Firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'test/**'
+      - 'platformio.ini'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'test/**'
+      - 'platformio.ini'
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Run host tests
+        run: pio test -e native
+      - name: Build Pico W firmware
+        run: pio run -e pico_w
