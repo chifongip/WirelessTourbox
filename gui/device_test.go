@@ -67,7 +67,7 @@ func TestParseLayoutValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseLayout(valid): %v", err)
 	}
-	if layout[9] != (Mapping{255, 113}) {
+	if layout[9] != SingleKeyMapping(255, 113) {
 		t.Fatalf("unexpected final mapping: %v", layout[9])
 	}
 	invalid := []string{
@@ -84,7 +84,7 @@ func TestParseLayoutValidation(t *testing.T) {
 
 func TestParseKeyEvent(t *testing.T) {
 	event := parseKeyEvent("KEY:6:0x2:0x6E")
-	if event == nil || event.Index != 6 || event.Modifier != 2 || event.Keycode != 0x6E {
+	if event == nil || event.Index != 6 || event.Modifier != 2 || event.Keys[0] != 0x6E {
 		t.Fatalf("unexpected event: %#v", event)
 	}
 	for _, line := range []string{"ready", "KEY:32:0x0:0x68", "KEY:x:0x0:0x68", "KEY:1:bad:0x68"} {
@@ -136,7 +136,7 @@ func TestDeviceSessionAndLegacyFallback(t *testing.T) {
 		}(i)
 	}
 	wait.Wait()
-	if got := device.GetLayoutData()[3]; got != (Mapping{3, 23}) {
+	if got := device.GetLayoutData()[3]; got != SingleKeyMapping(3, 23) {
 		t.Fatalf("updated mapping = %v", got)
 	}
 	events := device.EventChan()
@@ -233,7 +233,7 @@ func TestProtocolTwoLoadsDynamicLayersAndEvents(t *testing.T) {
 	if config.HoldMS != 250 || len(config.Layers) != 1 || config.Layers[0] != (LayerDefinition{1, 0}) {
 		t.Fatalf("unexpected layer configuration: %#v", config)
 	}
-	if got := layouts[1][1]; got != (Mapping{1, 4}) {
+	if got := layouts[1][1]; got != SingleKeyMapping(1, 4) {
 		t.Fatalf("layer mapping = %#v", got)
 	}
 	if err := device.SetLayerKey(1, 1, 1, 4); err != nil {
@@ -259,12 +259,100 @@ func TestParseLayerConfigurationRejectsDuplicates(t *testing.T) {
 	}
 }
 
+func TestParseCompoundLayout(t *testing.T) {
+	layout, err := parseChordLayout("5:4+5+6,0:0", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout[0] != (Mapping{Modifier: 5, Keys: [3]uint8{4, 5, 6}}) || layout[1] != (Mapping{}) {
+		t.Fatalf("unexpected compound layout: %#v", layout)
+	}
+	invalid := []string{
+		"1:4+4,0:0", "1:4+5+6+7,0:0", "1:0,0:0", "0:4+,0:0",
+	}
+	for _, response := range invalid {
+		if _, err := parseChordLayout(response, 2); err == nil {
+			t.Errorf("parseChordLayout(%q) unexpectedly succeeded", response)
+		}
+	}
+}
+
+func TestProtocolThreeLoadsAndSetsCompoundMappings(t *testing.T) {
+	fake := newFakePort()
+	commands := make(chan string, 16)
+	fake.onWrite = func(command string) {
+		commands <- command
+		switch command {
+		case "GET_INFO":
+			fake.feed("INFO:WirelessTourbox:3")
+		case "GET_CAPS":
+			fake.feed("CAPS:3:2:15:3")
+		case "GET_INPUTS":
+			fake.feed("INPUTS:0:S:1:Switch_1|1:S:1:Switch_2")
+		case "GET_LAYER_CONFIG":
+			fake.feed("LAYERCFG:200:")
+		case "GET_CHORDS:0":
+			fake.feed("5:4+5,0:76")
+		case "SET_CHORD:0:0:5:4+5+6":
+			fake.feed("OK")
+		}
+	}
+	previousOpen := openSerialPort
+	openSerialPort = func(string, *serial.Mode) (serialPort, error) { return fake, nil }
+	defer func() { openSerialPort = previousOpen }()
+
+	device := &Device{}
+	if err := device.Connect("fake"); err != nil {
+		t.Fatal(err)
+	}
+	defer device.Disconnect()
+	if err := device.Identify(); err != nil {
+		t.Fatal(err)
+	}
+	if err := device.LoadConfiguration(); err != nil {
+		t.Fatal(err)
+	}
+	caps, _, _, layouts := device.Snapshot()
+	if caps.Protocol != 3 || caps.MaxKeys != 3 || layouts[0][0].KeyCount() != 2 {
+		t.Fatalf("unexpected v3 configuration: %#v %#v", caps, layouts)
+	}
+	mapping := Mapping{Modifier: 5, Keys: [3]uint8{4, 5, 6}}
+	if err := device.SetLayerMapping(0, 0, mapping); err != nil {
+		t.Fatal(err)
+	}
+	if device.GetLayoutData()[0] != mapping {
+		t.Fatal("compound mapping cache was not updated")
+	}
+}
+
+func TestRuntimeLayerAttribution(t *testing.T) {
+	device := &Device{}
+	session := &deviceSession{eventCh: make(chan DeviceEvent, 4), respCh: make(chan string, 4)}
+	device.routeLine(session, "LAYER:2:ON")
+	device.routeLine(session, "KEY:7:0x1:0x4")
+	<-session.eventCh
+	event := <-session.eventCh
+	if event.Kind != "key" || event.Layer != 2 || event.Index != 7 {
+		t.Fatalf("unexpected attributed event: %#v", event)
+	}
+	device.routeLine(session, "LAYER:2:OFF")
+	device.routeLine(session, "KEY:0:0x0:0x68")
+	<-session.eventCh
+	event = <-session.eventCh
+	if event.Layer != 0 {
+		t.Fatalf("event remained in released layer: %#v", event)
+	}
+}
+
 func TestKeyChoicesAndModifierOrder(t *testing.T) {
 	if FormatKey(MOD_LCTRL, 0) != "No Action" || KeyCategory(0) != "Actions" {
 		t.Fatal("No Action mapping is not represented consistently")
 	}
 	if got := ModifierString(MOD_RGUI | MOD_LCTRL | MOD_LALT); got != "LCtrl+LAlt+RGui" {
 		t.Fatalf("ModifierString order = %q", got)
+	}
+	if got := FormatMapping(Mapping{Modifier: MOD_LCTRL | MOD_LALT, Keys: [3]uint8{HID_KEY_A, HID_KEY_B}}); got != "LCtrl+LAlt+A+B" {
+		t.Fatalf("compound format = %q", got)
 	}
 	functions := KeyChoices("Function")
 	if !contains(functions, "F1") || !contains(functions, "F24") {

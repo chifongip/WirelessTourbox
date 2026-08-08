@@ -20,27 +20,36 @@ import (
 )
 
 type App struct {
-	window      fyne.Window
-	device      *Device
-	statusLbl   *widget.Label
-	portSelect  *widget.Select
-	connectBtn  *widget.Button
-	refreshBtn  *widget.Button
-	resetBtn    *widget.Button
-	manageBtn   *widget.Button
-	mappingHost *fyne.Container
-	changeBtns  []*widget.Button
-	monitorLog  *widget.List
-	monEntries  []string
-	busy        bool
-	stopRefresh chan struct{}
-	closeOnce   sync.Once
+	window          fyne.Window
+	device          *Device
+	statusLbl       *widget.Label
+	portSelect      *widget.Select
+	connectBtn      *widget.Button
+	refreshBtn      *widget.Button
+	resetBtn        *widget.Button
+	manageBtn       *widget.Button
+	mappingHost     *fyne.Container
+	mappingTabs     *container.AppTabs
+	tabByLayer      map[int]int
+	layerByTab      []int
+	mappingLists    map[int]*widget.List
+	highlightedRows map[int]int
+	selectedLayer   int
+	monitorLog      *widget.List
+	monEntries      []string
+	busy            bool
+	stopRefresh     chan struct{}
+	closeOnce       sync.Once
 }
 
 var defaultCompactWindowSize = fyne.NewSize(760, 640)
 
 func NewApp(window fyne.Window, device *Device) *App {
-	return &App{window: window, device: device, stopRefresh: make(chan struct{})}
+	return &App{
+		window: window, device: device, stopRefresh: make(chan struct{}),
+		tabByLayer: make(map[int]int), mappingLists: make(map[int]*widget.List),
+		highlightedRows: make(map[int]int),
+	}
 }
 
 func (a *App) BuildUI() fyne.CanvasObject {
@@ -105,14 +114,21 @@ func (a *App) BuildUI() fyne.CanvasObject {
 	return container.NewPadded(content)
 }
 
-func (a *App) rebuildMappings() {
+func (a *App) rebuildMappings(targetLayer ...int) {
+	if len(targetLayer) > 0 {
+		a.selectedLayer = targetLayer[0]
+	}
 	_, inputs, layerConfig, layouts := a.device.Snapshot()
 	if len(inputs) == 0 {
 		inputs = append([]InputDescriptor(nil), legacyInputs...)
 		layouts = map[int][]Mapping{0: make([]Mapping, len(inputs))}
 	}
-	a.changeBtns = nil
+	a.tabByLayer = make(map[int]int)
+	a.layerByTab = nil
+	a.mappingLists = make(map[int]*widget.List)
 	tabs := []*container.TabItem{container.NewTabItem("Base", a.mappingTable(0, -1, inputs, layouts[0]))}
+	a.tabByLayer[0] = 0
+	a.layerByTab = append(a.layerByTab, 0)
 	sort.Slice(layerConfig.Layers, func(i, j int) bool { return layerConfig.Layers[i].Slot < layerConfig.Layers[j].Slot })
 	for _, layer := range layerConfig.Layers {
 		name := fmt.Sprintf("Layer %d", layer.Slot)
@@ -121,47 +137,110 @@ func (a *App) rebuildMappings() {
 		}
 		tabs = append(tabs, container.NewTabItem(name,
 			a.mappingTable(layer.Slot, layer.Trigger, inputs, layouts[layer.Slot])))
+		a.tabByLayer[layer.Slot] = len(tabs) - 1
+		a.layerByTab = append(a.layerByTab, layer.Slot)
 	}
 	appTabs := container.NewAppTabs(tabs...)
 	appTabs.SetTabLocation(container.TabLocationTop)
+	appTabs.OnSelected = func(_ *container.TabItem) {
+		index := appTabs.SelectedIndex()
+		if index >= 0 && index < len(a.layerByTab) {
+			a.selectedLayer = a.layerByTab[index]
+		}
+	}
+	a.mappingTabs = appTabs
 	a.mappingHost.Objects = []fyne.CanvasObject{appTabs}
 	a.mappingHost.Refresh()
+	if tab, ok := a.tabByLayer[a.selectedLayer]; ok {
+		appTabs.SelectIndex(tab)
+	} else {
+		a.selectedLayer = 0
+		appTabs.SelectIndex(0)
+	}
+	for layer, input := range a.highlightedRows {
+		if list := a.mappingLists[layer]; list != nil && input >= 0 && input < len(inputs) {
+			list.Select(input)
+		}
+	}
 	if a.connectBtn != nil && a.resetBtn != nil && a.manageBtn != nil {
 		a.updateControls()
 	}
 }
 
 func (a *App) mappingTable(layer, trigger int, inputs []InputDescriptor, mappings []Mapping) fyne.CanvasObject {
-	rows := container.NewVBox()
-	for i, input := range inputs {
-		mappingLabel := widget.NewLabel("—")
-		mappingLabel.TextStyle = fyne.TextStyle{Monospace: true}
-		if i < len(mappings) {
-			mappingLabel.SetText(FormatKey(mappings[i].Modifier, mappings[i].Keycode))
-		}
-		inputLabel := widget.NewLabel(input.Name)
-		inputLabel.Truncation = fyne.TextTruncateEllipsis
-		indexLabel := widget.NewLabel(strconv.Itoa(i))
-		indexLabel.Alignment = fyne.TextAlignCenter
-		index := i
-		button := widget.NewButton("Edit", func() { a.showKeyEditor(layer, index) })
-		if layer > 0 && index == trigger {
-			mappingLabel.SetText("Layer trigger")
-			button.SetText("—")
-			button.Disable()
-		}
-		a.changeBtns = append(a.changeBtns, button)
-		rows.Add(mappingRow(indexLabel, inputLabel, mappingLabel, button))
-	}
+	list := widget.NewList(
+		func() int { return len(inputs) },
+		func() fyne.CanvasObject {
+			indexLabel := widget.NewLabel("")
+			indexLabel.Alignment = fyne.TextAlignCenter
+			inputLabel := widget.NewLabel("")
+			inputLabel.Truncation = fyne.TextTruncateEllipsis
+			mappingLabel := widget.NewLabel("")
+			mappingLabel.TextStyle = fyne.TextStyle{Monospace: true}
+			button := widget.NewButton("Edit", nil)
+			view := &mappingRowView{index: indexLabel, input: inputLabel,
+				mapping: mappingLabel, button: button}
+			view.Container = mappingRow(indexLabel, inputLabel, mappingLabel, button)
+			return view
+		},
+		func(id widget.ListItemID, object fyne.CanvasObject) {
+			view := object.(*mappingRowView)
+			view.index.SetText(strconv.Itoa(id))
+			view.input.SetText(inputs[id].Name)
+			if id < len(mappings) {
+				view.mapping.SetText(FormatMapping(mappings[id]))
+			} else {
+				view.mapping.SetText("—")
+			}
+			index := id
+			view.button.SetText("Edit")
+			view.button.OnTapped = func() {
+				a.focusMapping(layer, index)
+				a.showKeyEditor(layer, index)
+			}
+			if layer > 0 && id == trigger {
+				view.mapping.SetText("Layer trigger")
+				view.button.SetText("—")
+				view.button.Disable()
+			} else if a.device.IsConnected() && !a.busy {
+				view.button.Enable()
+			} else {
+				view.button.Disable()
+			}
+		},
+	)
+	a.mappingLists[layer] = list
 	header := mappingRow(
 		widget.NewLabelWithStyle("#", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		widget.NewLabelWithStyle("Input", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabelWithStyle("Mapping", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabelWithStyle("Action", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 	)
-	scroll := container.NewVScroll(rows)
-	scroll.SetMinSize(fyne.NewSize(0, 230))
-	return container.NewBorder(header, nil, nil, nil, scroll)
+	listFloor := canvas.NewRectangle(color.Transparent)
+	listFloor.SetMinSize(fyne.NewSize(0, 230))
+	return container.NewBorder(header, nil, nil, nil, container.NewStack(listFloor, list))
+}
+
+type mappingRowView struct {
+	*fyne.Container
+	index   *widget.Label
+	input   *widget.Label
+	mapping *widget.Label
+	button  *widget.Button
+}
+
+func (a *App) focusMapping(layer, input int) {
+	tab, ok := a.tabByLayer[layer]
+	if !ok || a.mappingTabs == nil {
+		return
+	}
+	a.selectedLayer = layer
+	a.mappingTabs.SelectIndex(tab)
+	if list := a.mappingLists[layer]; list != nil {
+		a.highlightedRows[layer] = input
+		list.Select(input)
+		list.ScrollTo(input)
+	}
 }
 
 func mappingRow(index, input, mapping, action fyne.CanvasObject) *fyne.Container {
@@ -246,12 +325,8 @@ func (a *App) updateControls() {
 			a.connectBtn.SetText("Connect")
 		}
 	}
-	for _, button := range a.changeBtns {
-		if connected && !a.busy && button.Text != "—" {
-			button.Enable()
-		} else {
-			button.Disable()
-		}
+	for _, list := range a.mappingLists {
+		list.Refresh()
 	}
 	if connected && !a.busy {
 		a.resetBtn.Enable()
@@ -366,6 +441,32 @@ func (a *App) layerName(layer int) string {
 	return fmt.Sprintf("Layer %d", layer)
 }
 
+func (a *App) layerTrigger(layer int) int {
+	_, _, config, _ := a.device.Snapshot()
+	for _, definition := range config.Layers {
+		if definition.Slot == layer {
+			return definition.Trigger
+		}
+	}
+	return -1
+}
+
+func (a *App) eventMapping(event DeviceEvent) Mapping {
+	_, _, _, layouts := a.device.Snapshot()
+	if layout := layouts[event.Layer]; event.Index >= 0 && event.Index < len(layout) {
+		return layout[event.Index]
+	}
+	return Mapping{Modifier: event.Modifier, Keys: event.Keys}
+}
+
+func (a *App) navigateForDeviceEvent(event DeviceEvent) {
+	if event.Kind == "layer" && event.Action == "on" {
+		a.focusMapping(event.Layer, a.layerTrigger(event.Layer))
+	} else if event.Kind == "key" {
+		a.focusMapping(event.Layer, event.Index)
+	}
+}
+
 func (a *App) monitorSession(port string, events <-chan DeviceEvent, errors <-chan error) {
 	for events != nil || errors != nil {
 		select {
@@ -378,12 +479,16 @@ func (a *App) monitorSession(port string, events <-chan DeviceEvent, errors <-ch
 			if event.Kind == "layer" {
 				message = fmt.Sprintf("%s → %s", a.layerName(event.Layer), event.Action)
 			} else {
+				mapping := a.eventMapping(event)
 				message = fmt.Sprintf("%s → %s %s", a.inputName(event.Index),
-					FormatKey(event.Modifier, event.Keycode), event.Action)
+					FormatMapping(mapping), event.Action)
 			}
 			entry := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), message)
+			eventCopy := event
+			entryCopy := entry
 			fyne.Do(func() {
-				a.monEntries = append(a.monEntries, entry)
+				a.navigateForDeviceEvent(eventCopy)
+				a.monEntries = append(a.monEntries, entryCopy)
 				if len(a.monEntries) > 100 {
 					a.monEntries = a.monEntries[len(a.monEntries)-100:]
 				}
@@ -436,7 +541,7 @@ func (a *App) showLayerManager() {
 					return
 				}
 				manager.Hide()
-				a.runConfigChange("Removing layer…", func() error { return a.device.RemoveLayer(definition.Slot) })
+				a.runConfigChange("Removing layer…", 0, func() error { return a.device.RemoveLayer(definition.Slot) })
 			}, a.window)
 		})
 		remove.Importance = widget.DangerImportance
@@ -474,7 +579,7 @@ func (a *App) showLayerManager() {
 			return
 		}
 		manager.Hide()
-		a.runConfigChange("Adding layer…", func() error { return a.device.SetLayer(slot, trigger) })
+		a.runConfigChange("Adding layer…", slot, func() error { return a.device.SetLayer(slot, trigger) })
 	})
 	if len(eligibleNames) == 0 || len(config.Layers) >= caps.MaxLayers {
 		triggerSelect.Disable()
@@ -487,7 +592,7 @@ func (a *App) showLayerManager() {
 			return
 		}
 		manager.Hide()
-		a.runConfigChange("Updating hold threshold…", func() error { return a.device.SetHoldMS(value) })
+		a.runConfigChange("Updating hold threshold…", a.selectedLayer, func() error { return a.device.SetHoldMS(value) })
 	})
 	content := container.NewVBox(
 		widget.NewLabel("Hold a configured switch to activate its layer. Using another control activates it immediately."),
@@ -500,7 +605,7 @@ func (a *App) showLayerManager() {
 	manager.Show()
 }
 
-func (a *App) runConfigChange(status string, operation func() error) {
+func (a *App) runConfigChange(status string, targetLayer int, operation func() error) {
 	a.setBusy(true, status)
 	go func() {
 		err := operation()
@@ -508,7 +613,7 @@ func (a *App) runConfigChange(status string, operation func() error) {
 			if err != nil {
 				dialog.ShowError(err, a.window)
 			} else {
-				a.rebuildMappings()
+				a.rebuildMappings(targetLayer)
 			}
 			a.setBusy(false, connectedStatus(a.device))
 		})
@@ -525,39 +630,100 @@ func (a *App) showKeyEditor(layer, index int) {
 		return
 	}
 	current := currentLayout[index]
-	categorySelect := widget.NewSelect(KeyCategories, nil)
-	keySelect := widget.NewSelect(nil, nil)
-	categorySelect.OnChanged = func(category string) {
-		keySelect.Options = KeyChoices(category)
-		keySelect.Refresh()
-		if !contains(keySelect.Options, keySelect.Selected) && len(keySelect.Options) > 0 {
-			keySelect.SetSelected(keySelect.Options[0])
-		}
-	}
-	categorySelect.SetSelected(KeyCategory(current.Keycode))
-	keySelect.SetSelected(HIDKeyName(current.Keycode))
+	selectedKeys := make([]uint8, current.KeyCount())
+	copy(selectedKeys, current.Keys[:current.KeyCount()])
 
 	modifierChecks := make([]*widget.Check, len(ModifierNames))
 	for i, modifier := range ModifierNames {
 		modifierChecks[i] = widget.NewCheck(modifier.Name, nil)
 		modifierChecks[i].SetChecked(current.Modifier&modifier.Bit != 0)
 	}
-	status := widget.NewLabel("Use the picker, or click the capture area and press a shortcut.")
+	status := widget.NewLabel("Choose up to three keys, or capture one simultaneous chord.")
 	status.Wrapping = fyne.TextWrapWord
-	setEditorValue := func(modifier, keycode uint8) {
-		categorySelect.SetSelected(KeyCategory(keycode))
-		keySelect.SetSelected(HIDKeyName(keycode))
-		for i, item := range ModifierNames {
-			modifierChecks[i].SetChecked(modifier&item.Bit != 0)
+	keyRows := container.NewVBox()
+	addKey := widget.NewButton("Add Key", nil)
+	var rebuildKeyRows func()
+	rebuildKeyRows = func() {
+		keyRows.RemoveAll()
+		if len(selectedKeys) == 0 {
+			keyRows.Add(widget.NewLabel("No Action"))
 		}
-		status.SetText("Captured: " + FormatKey(modifier, keycode))
+		for slot, code := range selectedKeys {
+			slotIndex := slot
+			categorySelect := widget.NewSelect(KeyCategories[1:], nil)
+			keySelect := widget.NewSelect(nil, nil)
+			syncing := true
+			categorySelect.OnChanged = func(category string) {
+				keySelect.Options = KeyChoices(category)
+				keySelect.Refresh()
+				if !contains(keySelect.Options, keySelect.Selected) && len(keySelect.Options) > 0 {
+					keySelect.SetSelected(keySelect.Options[0])
+				}
+			}
+			keySelect.OnChanged = func(name string) {
+				if syncing {
+					return
+				}
+				if key, found := KeyCodeByName(name); found && slotIndex < len(selectedKeys) {
+					selectedKeys[slotIndex] = key
+				}
+			}
+			categorySelect.SetSelected(KeyCategory(code))
+			keySelect.SetSelected(HIDKeyName(code))
+			syncing = false
+			remove := widget.NewButton("Remove", func() {
+				selectedKeys = append(selectedKeys[:slotIndex], selectedKeys[slotIndex+1:]...)
+				rebuildKeyRows()
+			})
+			remove.Importance = widget.LowImportance
+			keyRows.Add(container.NewBorder(nil, nil,
+				widget.NewLabel(fmt.Sprintf("Key %d", slot+1)), remove,
+				container.NewGridWithColumns(2, categorySelect, keySelect)))
+		}
+		if len(selectedKeys) >= maxMappingKeys {
+			addKey.Disable()
+		} else {
+			addKey.Enable()
+		}
+	}
+	addKey.OnTapped = func() {
+		if len(selectedKeys) >= maxMappingKeys {
+			return
+		}
+		candidate := uint8(HID_KEY_A)
+		for containsKeycode(selectedKeys, candidate) {
+			candidate++
+		}
+		selectedKeys = append(selectedKeys, candidate)
+		rebuildKeyRows()
+	}
+	clearKeys := widget.NewButton("No Action", func() {
+		selectedKeys = nil
+		for _, check := range modifierChecks {
+			check.SetChecked(false)
+		}
+		rebuildKeyRows()
+	})
+	clearKeys.Importance = widget.LowImportance
+
+	setEditorValue := func(mapping Mapping) {
+		selectedKeys = append(selectedKeys[:0], mapping.Keys[:mapping.KeyCount()]...)
+		for i, item := range ModifierNames {
+			modifierChecks[i].SetChecked(mapping.Modifier&item.Bit != 0)
+		}
+		rebuildKeyRows()
+		status.SetText("Captured: " + FormatMapping(mapping))
 	}
 	capture := newKeyCaptureCanvas(setEditorValue, func() {
 		status.SetText("Capture cancelled; picker selection is unchanged.")
+	}, func(message string) {
+		status.SetText(message)
 	})
+	rebuildKeyRows()
 	content := container.NewVBox(
 		widget.NewLabelWithStyle("Remap: "+inputs[index].Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(), container.NewGridWithColumns(2, categorySelect, keySelect),
+		widget.NewSeparator(), keyRows,
+		container.NewHBox(addKey, clearKeys),
 		container.NewHBox(modifierChecks[0], modifierChecks[1], modifierChecks[2], modifierChecks[3]),
 		container.NewHBox(modifierChecks[4], modifierChecks[5], modifierChecks[6], modifierChecks[7]),
 		widget.NewSeparator(), capture, status,
@@ -567,30 +733,33 @@ func (a *App) showKeyEditor(layer, index int) {
 		if !ok {
 			return
 		}
-		keycode, found := KeyCodeByName(keySelect.Selected)
-		if !found {
-			dialog.ShowError(fmt.Errorf("select a key"), a.window)
-			return
-		}
 		var modifier uint8
-		if keycode != 0 {
+		if len(selectedKeys) != 0 {
 			for i, item := range ModifierNames {
 				if modifierChecks[i].Checked {
 					modifier |= item.Bit
 				}
 			}
 		}
+		mapping := Mapping{Modifier: modifier}
+		for i, key := range selectedKeys {
+			if containsKeycode(selectedKeys[:i], key) {
+				dialog.ShowError(fmt.Errorf("a chord cannot contain the same key twice"), a.window)
+				return
+			}
+			mapping.Keys[i] = key
+		}
 		duplicate := -1
-		for i, mapping := range currentLayout {
-			if i != index && mapping.Modifier == modifier && mapping.Keycode == keycode {
+		for i, candidate := range currentLayout {
+			if i != index && sameChord(candidate, mapping) {
 				duplicate = i
 				break
 			}
 		}
-		apply := func() { a.applyMapping(layer, index, modifier, keycode) }
-		if duplicate >= 0 && keycode != 0 {
+		apply := func() { a.applyMapping(layer, index, mapping) }
+		if duplicate >= 0 && mapping.KeyCount() != 0 {
 			message := fmt.Sprintf("%s already uses %s in this layer. Apply the duplicate mapping?",
-				inputs[duplicate].Name, FormatKey(modifier, keycode))
+				inputs[duplicate].Name, FormatMapping(mapping))
 			dialog.ShowConfirm("Duplicate Mapping", message, func(confirmed bool) {
 				if confirmed {
 					apply()
@@ -600,19 +769,41 @@ func (a *App) showKeyEditor(layer, index int) {
 		}
 		apply()
 	}, a.window)
-	d.Resize(fyne.NewSize(520, 360))
+	d.Resize(fyne.NewSize(560, 500))
 	d.Show()
 }
 
-func (a *App) applyMapping(layer, index int, modifier, keycode uint8) {
+func containsKeycode(keys []uint8, wanted uint8) bool {
+	for _, key := range keys {
+		if key == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func sameChord(left, right Mapping) bool {
+	if left.Modifier != right.Modifier || left.KeyCount() != right.KeyCount() {
+		return false
+	}
+	for i := 0; i < left.KeyCount(); i++ {
+		if !containsKeycode(right.Keys[:right.KeyCount()], left.Keys[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) applyMapping(layer, index int, mapping Mapping) {
 	a.setBusy(true, "Applying mapping…")
 	go func() {
-		err := a.device.SetLayerKey(layer, index, modifier, keycode)
+		err := a.device.SetLayerMapping(layer, index, mapping)
 		fyne.Do(func() {
 			if err != nil {
 				dialog.ShowError(err, a.window)
 			} else {
-				a.rebuildMappings()
+				a.highlightedRows[layer] = index
+				a.rebuildMappings(layer)
 			}
 			a.setBusy(false, connectedStatus(a.device))
 		})
@@ -621,13 +812,18 @@ func (a *App) applyMapping(layer, index int, modifier, keycode uint8) {
 
 type keyCaptureCanvas struct {
 	widget.BaseWidget
-	onCapture func(modifier, keycode uint8)
+	onCapture func(Mapping)
 	onCancel  func()
+	onStatus  func(string)
 	focused   bool
+	pressed   map[fyne.KeyName]bool
+	gesture   Mapping
+	overflow  bool
 }
 
-func newKeyCaptureCanvas(onCapture func(modifier, keycode uint8), onCancel func()) *keyCaptureCanvas {
-	canvas := &keyCaptureCanvas{onCapture: onCapture, onCancel: onCancel}
+func newKeyCaptureCanvas(onCapture func(Mapping), onCancel func(), onStatus func(string)) *keyCaptureCanvas {
+	canvas := &keyCaptureCanvas{onCapture: onCapture, onCancel: onCancel,
+		onStatus: onStatus, pressed: make(map[fyne.KeyName]bool)}
 	canvas.ExtendBaseWidget(canvas)
 	return canvas
 }
@@ -647,12 +843,89 @@ func (k *keyCaptureCanvas) Tapped(_ *fyne.PointEvent) {
 }
 
 func (k *keyCaptureCanvas) FocusGained() { k.focused = true; k.Refresh() }
-func (k *keyCaptureCanvas) FocusLost()   { k.focused = false; k.Refresh() }
+func (k *keyCaptureCanvas) FocusLost() {
+	k.focused = false
+	k.resetGesture()
+	k.Refresh()
+}
+
+func modifierForKey(name fyne.KeyName) (uint8, bool) {
+	switch name {
+	case desktop.KeyControlLeft:
+		return MOD_LCTRL, true
+	case desktop.KeyControlRight:
+		return MOD_RCTRL, true
+	case desktop.KeyShiftLeft:
+		return MOD_LSHIFT, true
+	case desktop.KeyShiftRight:
+		return MOD_RSHIFT, true
+	case desktop.KeyAltLeft:
+		return MOD_LALT, true
+	case desktop.KeyAltRight:
+		return MOD_RALT, true
+	case desktop.KeySuperLeft:
+		return MOD_LGUI, true
+	case desktop.KeySuperRight:
+		return MOD_RGUI, true
+	default:
+		return 0, false
+	}
+}
+
+func (k *keyCaptureCanvas) resetGesture() {
+	k.pressed = make(map[fyne.KeyName]bool)
+	k.gesture = Mapping{}
+	k.overflow = false
+}
+
+func (k *keyCaptureCanvas) KeyDown(event *fyne.KeyEvent) {
+	if event.Name == fyne.KeyEscape {
+		k.resetGesture()
+		k.onCancel()
+		return
+	}
+	if k.pressed[event.Name] {
+		return
+	}
+	k.pressed[event.Name] = true
+	if modifier, ok := modifierForKey(event.Name); ok {
+		k.gesture.Modifier |= modifier
+		return
+	}
+	keycode, ok := FyneToHID[event.Name]
+	if !ok || containsKeycode(k.gesture.Keys[:k.gesture.KeyCount()], keycode) {
+		return
+	}
+	count := k.gesture.KeyCount()
+	if count >= maxMappingKeys {
+		k.overflow = true
+		k.onStatus("A chord can contain at most three regular keys.")
+		return
+	}
+	k.gesture.Keys[count] = keycode
+	k.onStatus("Capturing: " + FormatMapping(k.gesture) + " — release all keys to accept")
+}
+
+func (k *keyCaptureCanvas) KeyUp(event *fyne.KeyEvent) {
+	delete(k.pressed, event.Name)
+	if len(k.pressed) != 0 {
+		return
+	}
+	gesture := k.gesture
+	overflow := k.overflow
+	k.resetGesture()
+	if !overflow && gesture.KeyCount() > 0 {
+		k.onCapture(gesture)
+	}
+}
 
 func (k *keyCaptureCanvas) TypedRune(r rune) {
+	if len(k.pressed) > 0 {
+		return
+	}
 	keycode, shifted := ShiftedRuneToHID[r]
 	if shifted {
-		k.onCapture(MOD_LSHIFT, keycode)
+		k.onCapture(SingleKeyMapping(MOD_LSHIFT, keycode))
 		return
 	}
 	keycode, ok := RuneToHID[unicode.ToLower(r)]
@@ -663,10 +936,13 @@ func (k *keyCaptureCanvas) TypedRune(r rune) {
 	if unicode.IsUpper(r) {
 		modifier = MOD_LSHIFT
 	}
-	k.onCapture(modifier, keycode)
+	k.onCapture(SingleKeyMapping(modifier, keycode))
 }
 
 func (k *keyCaptureCanvas) TypedKey(event *fyne.KeyEvent) {
+	if len(k.pressed) > 0 {
+		return
+	}
 	if event.Name == fyne.KeyEscape {
 		k.onCancel()
 		return
@@ -691,7 +967,7 @@ func (k *keyCaptureCanvas) TypedKey(event *fyne.KeyEvent) {
 			modifier |= MOD_LGUI
 		}
 	}
-	k.onCapture(modifier, keycode)
+	k.onCapture(SingleKeyMapping(modifier, keycode))
 }
 
 var builtinShortcuts = map[string]uint8{
@@ -702,12 +978,15 @@ var builtinShortcuts = map[string]uint8{
 }
 
 func (k *keyCaptureCanvas) TypedShortcut(shortcut fyne.Shortcut) {
+	if len(k.pressed) > 0 {
+		return
+	}
 	if keycode, ok := builtinShortcuts[shortcut.ShortcutName()]; ok {
 		modifier := uint8(MOD_LCTRL)
 		if fyne.KeyModifierShortcutDefault == fyne.KeyModifierSuper {
 			modifier = MOD_LGUI
 		}
-		k.onCapture(modifier, keycode)
+		k.onCapture(SingleKeyMapping(modifier, keycode))
 		return
 	}
 	custom, ok := shortcut.(*desktop.CustomShortcut)
@@ -731,7 +1010,7 @@ func (k *keyCaptureCanvas) TypedShortcut(shortcut fyne.Shortcut) {
 	if custom.Modifier&fyne.KeyModifierSuper != 0 {
 		modifier |= MOD_LGUI
 	}
-	k.onCapture(modifier, keycode)
+	k.onCapture(SingleKeyMapping(modifier, keycode))
 }
 
 type keyCaptureRenderer struct {

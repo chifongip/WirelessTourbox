@@ -261,17 +261,26 @@ var ShiftedRuneToHID = map[rune]uint8{
 
 // FormatKey returns a human-readable string for a modifier+keycode combination.
 func FormatKey(mod, keycode uint8) string {
-	if keycode == 0 {
+	return FormatMapping(SingleKeyMapping(mod, keycode))
+}
+
+// FormatMapping returns a human-readable simultaneous keyboard chord.
+func FormatMapping(mapping Mapping) string {
+	if mapping.KeyCount() == 0 {
 		return "No Action"
 	}
-	name, ok := HIDNames[keycode]
-	if !ok {
-		name = fmt.Sprintf("0x%02X", keycode)
+	parts := make([]string, 0, mapping.KeyCount()+1)
+	if mapping.Modifier != 0 {
+		parts = append(parts, ModifierString(mapping.Modifier))
 	}
-	if mod == 0 {
-		return name
+	for i := 0; i < mapping.KeyCount(); i++ {
+		name, ok := HIDNames[mapping.Keys[i]]
+		if !ok {
+			name = fmt.Sprintf("0x%02X", mapping.Keys[i])
+		}
+		parts = append(parts, name)
 	}
-	return ModifierString(mod) + "+" + name
+	return strings.Join(parts, "+")
 }
 
 // ModifierString returns a human-readable string for a modifier bitmask.

@@ -18,6 +18,7 @@ const (
 	defaultHoldMS  = 200
 	minimumHoldMS  = 100
 	maximumHoldMS  = 1000
+	maxMappingKeys = 3
 )
 
 type PortInfo struct {
@@ -27,7 +28,24 @@ type PortInfo struct {
 
 type Mapping struct {
 	Modifier uint8
-	Keycode  uint8
+	Keys     [maxMappingKeys]uint8
+}
+
+func SingleKeyMapping(modifier, keycode uint8) Mapping {
+	mapping := Mapping{Modifier: modifier, Keys: [maxMappingKeys]uint8{keycode}}
+	if keycode == 0 {
+		mapping.Modifier = 0
+	}
+	return mapping
+}
+
+func (m Mapping) KeyCount() int {
+	for i, key := range m.Keys {
+		if key == 0 {
+			return i
+		}
+	}
+	return len(m.Keys)
 }
 
 type InputDescriptor struct {
@@ -41,6 +59,7 @@ type DeviceCapabilities struct {
 	Protocol   int
 	InputCount int
 	MaxLayers  int
+	MaxKeys    int
 }
 
 type LayerDefinition struct {
@@ -58,7 +77,7 @@ type DeviceEvent struct {
 	Index    int
 	Layer    int
 	Modifier uint8
-	Keycode  uint8
+	Keys     [maxMappingKeys]uint8
 	Action   string
 }
 
@@ -101,6 +120,7 @@ type Device struct {
 	inputs          []InputDescriptor
 	layerConfig     LayerConfig
 	layouts         map[int][]Mapping
+	runtimeLayer    int
 }
 
 var legacyInputs = []InputDescriptor{
@@ -112,9 +132,11 @@ var legacyInputs = []InputDescriptor{
 }
 
 var defaultLayout = []Mapping{
-	{0x00, 0x68}, {0x00, 0x69}, {0x00, 0x6A}, {0x00, 0x6B},
-	{0x00, 0x6C}, {0x00, 0x6D}, {0x00, 0x6E}, {0x00, 0x6F},
-	{0x00, 0x70}, {0x00, 0x71},
+	SingleKeyMapping(0x00, 0x68), SingleKeyMapping(0x00, 0x69),
+	SingleKeyMapping(0x00, 0x6A), SingleKeyMapping(0x00, 0x6B),
+	SingleKeyMapping(0x00, 0x6C), SingleKeyMapping(0x00, 0x6D),
+	SingleKeyMapping(0x00, 0x6E), SingleKeyMapping(0x00, 0x6F),
+	SingleKeyMapping(0x00, 0x70), SingleKeyMapping(0x00, 0x71),
 }
 
 func ListPorts() ([]PortInfo, error) {
@@ -156,6 +178,7 @@ func (d *Device) Connect(portName string) error {
 	d.inputs = nil
 	d.layerConfig = LayerConfig{}
 	d.layouts = make(map[int][]Mapping)
+	d.runtimeLayer = 0
 	d.mu.Unlock()
 	go d.readLoop(session)
 	return nil
@@ -170,6 +193,7 @@ func (d *Device) Disconnect() error {
 	d.inputs = nil
 	d.layerConfig = LayerConfig{}
 	d.layouts = nil
+	d.runtimeLayer = 0
 	d.mu.Unlock()
 	if session != nil {
 		session.stop()
@@ -249,6 +273,7 @@ func (d *Device) readLoop(session *deviceSession) {
 				d.inputs = nil
 				d.layerConfig = LayerConfig{}
 				d.layouts = nil
+				d.runtimeLayer = 0
 			}
 			d.mu.Unlock()
 			select {
@@ -271,6 +296,17 @@ func (d *Device) routeLine(session *deviceSession, line string) {
 		return
 	}
 	if event := parseDeviceEvent(line); event != nil {
+		d.mu.Lock()
+		if event.Kind == "layer" {
+			if event.Action == "on" {
+				d.runtimeLayer = event.Layer
+			} else if d.runtimeLayer == event.Layer {
+				d.runtimeLayer = 0
+			}
+		} else if event.Kind == "key" {
+			event.Layer = d.runtimeLayer
+		}
+		d.mu.Unlock()
 		select {
 		case session.eventCh <- *event:
 		default:
@@ -298,7 +334,8 @@ func parseDeviceEvent(line string) *DeviceEvent {
 		if err != nil {
 			return nil
 		}
-		return &DeviceEvent{Kind: "key", Index: index, Modifier: uint8(modifier), Keycode: uint8(keycode), Action: "pressed"}
+		return &DeviceEvent{Kind: "key", Index: index, Modifier: uint8(modifier),
+			Keys: [maxMappingKeys]uint8{uint8(keycode)}, Action: "pressed"}
 	}
 	if len(parts) == 3 && parts[0] == "LAYER" {
 		layer, err := strconv.Atoi(parts[1])
@@ -326,9 +363,12 @@ func responseMatches(command, response string) bool {
 		return strings.HasPrefix(response, "INPUTS:")
 	case command == "GET_LAYER_CONFIG":
 		return strings.HasPrefix(response, "LAYERCFG:")
+	case strings.HasPrefix(command, "GET_CHORDS:"):
+		return strings.Contains(response, ":")
 	case strings.HasPrefix(command, "GET_LAYOUT"):
 		return strings.Contains(response, ":") && !strings.Contains(response, "WirelessTourbox ready")
 	case command == "RESET_DEFAULTS", strings.HasPrefix(command, "SET_KEY:"),
+		strings.HasPrefix(command, "SET_CHORD:"),
 		strings.HasPrefix(command, "SET_LAYER:"), strings.HasPrefix(command, "REMOVE_LAYER:"),
 		strings.HasPrefix(command, "SET_HOLD_MS:"):
 		return response == "OK"
@@ -386,7 +426,7 @@ func (d *Device) Identify() error {
 			return fmt.Errorf("selected port is not a WirelessTourbox")
 		}
 		version, err = strconv.Atoi(parts[2])
-		if err != nil || version < 1 || version > 2 {
+		if err != nil || version < 1 || version > 3 {
 			return fmt.Errorf("unsupported protocol response: %s", response)
 		}
 	}
@@ -415,23 +455,97 @@ func parseLayout(response string, expected int) ([]Mapping, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid keycode in mapping %d", i)
 		}
-		layout[i] = Mapping{uint8(modifier), uint8(keycode)}
+		layout[i] = SingleKeyMapping(uint8(modifier), uint8(keycode))
+	}
+	return layout, nil
+}
+
+func validateMapping(mapping Mapping) error {
+	seenZero := false
+	seen := make(map[uint8]bool)
+	for _, key := range mapping.Keys {
+		if key == 0 {
+			seenZero = true
+			continue
+		}
+		if seenZero {
+			return fmt.Errorf("keys must be packed before empty slots")
+		}
+		if seen[key] {
+			return fmt.Errorf("duplicate keycode %d", key)
+		}
+		seen[key] = true
+	}
+	if len(seen) == 0 && mapping.Modifier != 0 {
+		return fmt.Errorf("No Action cannot include modifiers")
+	}
+	return nil
+}
+
+func parseChordLayout(response string, expected int) ([]Mapping, error) {
+	entries := strings.Split(response, ",")
+	if len(entries) != expected {
+		return nil, fmt.Errorf("expected %d mappings, got %d", expected, len(entries))
+	}
+	layout := make([]Mapping, expected)
+	for index, entry := range entries {
+		parts := strings.Split(entry, ":")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid chord mapping %q", entry)
+		}
+		modifier, err := strconv.ParseUint(parts[0], 10, 8)
+		if err != nil {
+			return nil, fmt.Errorf("invalid modifier in mapping %d", index)
+		}
+		keyParts := strings.Split(parts[1], "+")
+		if len(keyParts) > maxMappingKeys || len(keyParts) == 0 {
+			return nil, fmt.Errorf("invalid key count in mapping %d", index)
+		}
+		mapping := Mapping{Modifier: uint8(modifier)}
+		for keyIndex, keyText := range keyParts {
+			key, parseErr := strconv.ParseUint(keyText, 10, 8)
+			if parseErr != nil {
+				return nil, fmt.Errorf("invalid key in mapping %d", index)
+			}
+			mapping.Keys[keyIndex] = uint8(key)
+		}
+		if mapping.Keys[0] == 0 {
+			if len(keyParts) != 1 || mapping.Modifier != 0 {
+				return nil, fmt.Errorf("invalid No Action mapping %d", index)
+			}
+		}
+		if err := validateMapping(mapping); err != nil {
+			return nil, fmt.Errorf("invalid mapping %d: %w", index, err)
+		}
+		layout[index] = mapping
 	}
 	return layout, nil
 }
 
 func parseCapabilities(response string) (DeviceCapabilities, error) {
 	parts := strings.Split(response, ":")
-	if len(parts) != 4 || parts[0] != "CAPS" {
+	if (len(parts) != 4 && len(parts) != 5) || parts[0] != "CAPS" {
 		return DeviceCapabilities{}, fmt.Errorf("invalid capabilities: %s", response)
 	}
 	protocol, err1 := strconv.Atoi(parts[1])
 	inputs, err2 := strconv.Atoi(parts[2])
 	layers, err3 := strconv.Atoi(parts[3])
-	if err1 != nil || err2 != nil || err3 != nil || protocol != 2 || inputs < 1 || inputs > 32 || layers < 1 || layers > 15 {
+	if err1 != nil || err2 != nil || err3 != nil || protocol < 2 || protocol > 3 || inputs < 1 || inputs > 32 || layers < 1 || layers > 15 {
 		return DeviceCapabilities{}, fmt.Errorf("invalid capabilities: %s", response)
 	}
-	return DeviceCapabilities{protocol, inputs, layers}, nil
+	maxKeys := 1
+	if protocol >= 3 {
+		if len(parts) != 5 {
+			return DeviceCapabilities{}, fmt.Errorf("missing chord capability: %s", response)
+		}
+		maxKeys, err1 = strconv.Atoi(parts[4])
+		if err1 != nil || maxKeys != maxMappingKeys {
+			return DeviceCapabilities{}, fmt.Errorf("unsupported chord capability: %s", response)
+		}
+	} else if len(parts) != 4 {
+		return DeviceCapabilities{}, fmt.Errorf("invalid capabilities: %s", response)
+	}
+	return DeviceCapabilities{Protocol: protocol, InputCount: inputs, MaxLayers: layers, MaxKeys: maxKeys}, nil
 }
 
 func parseInputs(response string, expected int) ([]InputDescriptor, error) {
@@ -502,7 +616,7 @@ func (d *Device) LoadConfiguration() error {
 			return err
 		}
 		d.mu.Lock()
-		d.capabilities = DeviceCapabilities{Protocol: protocol, InputCount: numInputs}
+		d.capabilities = DeviceCapabilities{Protocol: protocol, InputCount: numInputs, MaxKeys: 1}
 		d.inputs = append([]InputDescriptor(nil), legacyInputs...)
 		d.layerConfig = LayerConfig{HoldMS: defaultHoldMS}
 		d.layouts = map[int][]Mapping{0: layout}
@@ -517,6 +631,9 @@ func (d *Device) LoadConfiguration() error {
 	caps, err := parseCapabilities(capsResponse)
 	if err != nil {
 		return err
+	}
+	if caps.Protocol != protocol {
+		return fmt.Errorf("protocol mismatch: identity %d, capabilities %d", protocol, caps.Protocol)
 	}
 	inputsResponse, err := d.sendCommand("GET_INPUTS")
 	if err != nil {
@@ -541,11 +658,20 @@ func (d *Device) LoadConfiguration() error {
 	}
 	for _, layer := range layerNumbers {
 		command := fmt.Sprintf("GET_LAYOUT:%d", layer)
+		if protocol >= 3 {
+			command = fmt.Sprintf("GET_CHORDS:%d", layer)
+		}
 		response, commandErr := d.sendCommand(command)
 		if commandErr != nil {
 			return commandErr
 		}
-		layout, parseErr := parseLayout(response, caps.InputCount)
+		var layout []Mapping
+		var parseErr error
+		if protocol >= 3 {
+			layout, parseErr = parseChordLayout(response, caps.InputCount)
+		} else {
+			layout, parseErr = parseLayout(response, caps.InputCount)
+		}
 		if parseErr != nil {
 			return parseErr
 		}
@@ -567,6 +693,24 @@ func (d *Device) SetKey(index int, modifier, keycode uint8) error {
 }
 
 func (d *Device) SetLayerKey(layer, index int, modifier, keycode uint8) error {
+	return d.SetLayerMapping(layer, index, SingleKeyMapping(modifier, keycode))
+}
+
+func chordKeyString(mapping Mapping) string {
+	if mapping.KeyCount() == 0 {
+		return "0"
+	}
+	parts := make([]string, mapping.KeyCount())
+	for i := range parts {
+		parts[i] = strconv.Itoa(int(mapping.Keys[i]))
+	}
+	return strings.Join(parts, "+")
+}
+
+func (d *Device) SetLayerMapping(layer, index int, mapping Mapping) error {
+	if err := validateMapping(mapping); err != nil {
+		return fmt.Errorf("invalid mapping: %w", err)
+	}
 	d.mu.RLock()
 	inputCount := d.capabilities.InputCount
 	protocol := d.protocolVersion
@@ -575,9 +719,13 @@ func (d *Device) SetLayerKey(layer, index int, modifier, keycode uint8) error {
 	if index < 0 || index >= inputCount || layer < 0 || !layerExists {
 		return fmt.Errorf("invalid layer or input: %d/%d", layer, index)
 	}
-	command := fmt.Sprintf("SET_KEY:%d:%d:%d", index, modifier, keycode)
+	command := fmt.Sprintf("SET_KEY:%d:%d:%d", index, mapping.Modifier, mapping.Keys[0])
 	if protocol >= 2 {
-		command = fmt.Sprintf("SET_KEY:%d:%d:%d:%d", layer, index, modifier, keycode)
+		command = fmt.Sprintf("SET_KEY:%d:%d:%d:%d", layer, index, mapping.Modifier, mapping.Keys[0])
+	}
+	if protocol >= 3 {
+		command = fmt.Sprintf("SET_CHORD:%d:%d:%d:%s", layer, index,
+			mapping.Modifier, chordKeyString(mapping))
 	}
 	response, err := d.sendCommand(command)
 	if err != nil {
@@ -587,7 +735,7 @@ func (d *Device) SetLayerKey(layer, index int, modifier, keycode uint8) error {
 		return fmt.Errorf("device rejected mapping: %s", response)
 	}
 	d.mu.Lock()
-	d.layouts[layer][index] = Mapping{modifier, keycode}
+	d.layouts[layer][index] = mapping
 	d.mu.Unlock()
 	return nil
 }
@@ -648,7 +796,7 @@ func (d *Device) ResetDefaults() error {
 			return d.LoadConfiguration()
 		}
 		d.mu.Lock()
-		d.capabilities = DeviceCapabilities{Protocol: protocol, InputCount: numInputs}
+		d.capabilities = DeviceCapabilities{Protocol: protocol, InputCount: numInputs, MaxKeys: 1}
 		d.inputs = append([]InputDescriptor(nil), legacyInputs...)
 		d.layerConfig = LayerConfig{HoldMS: defaultHoldMS}
 		d.layouts = map[int][]Mapping{0: append([]Mapping(nil), defaultLayout...)}
@@ -656,7 +804,7 @@ func (d *Device) ResetDefaults() error {
 		return nil
 	}
 	for i, mapping := range defaultLayout {
-		if err := d.SetKey(i, mapping.Modifier, mapping.Keycode); err != nil {
+		if err := d.SetKey(i, mapping.Modifier, mapping.Keys[0]); err != nil {
 			return fmt.Errorf("reset input %d: %w", i, err)
 		}
 	}

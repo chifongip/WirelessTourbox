@@ -19,15 +19,15 @@ A compact, highly tactile desktop macro controller inspired by the TourBox, opti
 - **Encoder 2 (Click Switch):** GPIO 12
 
 ## Memory & Configuration Architecture
-- **Storage:** `EEPROM.h` (Flash emulation on Pico) stores a versioned 1,047-byte image protected by CRC16-CCITT.
+- **Storage:** `EEPROM.h` (Flash emulation on Pico) stores a versioned 2,071-byte image protected by CRC16-CCITT.
 - **Capacity:** 32 input descriptors and 16 mapping tables (Base plus 15 optional layers).
-- **EEPROM Layout:** magic `0x5742`, schema `2`, stored input count, hold threshold, 15 trigger indexes, 16 × 32 modifier/key pairs, then CRC16.
-- **Boot Behavior:** Invalid data restores defaults. The legacy `0xA5`/21-byte layout is migrated automatically, preserving all ten Base mappings while initializing layers to No Action.
+- **EEPROM Layout:** magic `0x5742`, schema `3`, stored input count, hold threshold, 15 trigger indexes, 16 × 32 fixed mappings containing one modifier byte and three key bytes, then CRC16.
+- **Boot Behavior:** Invalid data restores defaults. Legacy `0xA5` and schema-v2 layouts migrate automatically; existing keys become the first key in each compound mapping.
 - **USB Architecture:** Composite Device providing both **USB HID Keyboard** and **USB Serial (CDC)** simultaneously via Adafruit TinyUSB.
 - **Communication Protocol:** The firmware listens on the Serial port for configuration commands.
 
 ### Default Configuration Array Mappings
-Each input is 2 bytes: [modifier, keycode]. Default mappings use no modifier (0x00).
+Each input reserves four bytes: `[modifier, key1, key2, key3]`. Default mappings use one key and no modifier.
 
 | Index | Input | Modifier | Keycode | Key Name |
 |-------|-------|----------|---------|----------|
@@ -56,8 +56,9 @@ Each input is 2 bytes: [modifier, keycode]. Default mappings use no modifier (0x
 
 ### Serial Command Spec
 - `GET_LAYOUT` and `SET_KEY:[index]:[modifier]:[keycode]` remain Base-only compatibility commands.
-- `GET_INFO` → `INFO:WirelessTourbox:2`; `GET_CAPS` and `GET_INPUTS` describe runtime limits and inputs.
+- `GET_INFO` → `INFO:WirelessTourbox:3`; `GET_CAPS` reports the three-key mapping limit.
 - `GET_LAYOUT:[layer]` and `SET_KEY:[layer]:[index]:[modifier]:[keycode]` access layered mappings.
+- `GET_CHORDS:[layer]` and `SET_CHORD:[layer]:[index]:[modifier]:[key1]+[key2]+[key3]` access full compound mappings.
 - `GET_LAYER_CONFIG`, `SET_LAYER`, `REMOVE_LAYER`, and `SET_HOLD_MS` manage tap/hold layers.
 - `RESET_DEFAULTS` restores Base defaults, removes all layers, and restores the 200 ms threshold.
 
@@ -82,14 +83,16 @@ Only firmware-designated physical switches can trigger layers; encoder clicks an
 ### GUI Config Tool (Go + Fyne)
 - Cross-platform native desktop application (Windows, macOS, Linux)
 - Live key capture for remapping
+- Simultaneous capture of up to three regular keys plus left/right modifiers
 - Duplicate mapping confirmation
 - Categorized key picker with all left/right modifiers
 - Dynamic Base/layer tabs, No Action mappings, and a layer manager
+- Persistent tab selection with hardware-driven scrolling and row highlighting
 - Fixed-height real-time input monitor
 - Single-reader serial architecture that separates command responses from `KEY:` debug events
 
 ### Key Capture Implementation (Fyne)
-The key capture widget uses three methods to handle different key types:
+Desktop `KeyDown`/`KeyUp` events track a complete simultaneous chord until all keys are released. The existing typed-event handlers remain as single-key fallbacks:
 - `TypedRune(r rune)` — printable characters (a-z, 0-9, symbols). Uppercase letters automatically get LShift modifier.
 - `TypedKey(event *fyne.KeyEvent)` — special keys (F1-F24, arrows, Enter, Escape, etc.) and Shift+key combinations. Uses `desktop.Driver.CurrentKeyModifiers()` to detect Shift state.
 - `TypedShortcut(shortcut fyne.Shortcut)` — Ctrl/Alt+key combinations. Fyne intercepts these as shortcuts before they reach TypedKey. Handles both built-in shortcuts (Ctrl+C→Copy, etc.) and custom shortcuts via `*desktop.CustomShortcut`.

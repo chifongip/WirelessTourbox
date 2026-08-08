@@ -9,11 +9,40 @@ constexpr uint8_t MAX_INPUTS = 32;
 constexpr uint8_t MAX_LAYERS = 15;
 constexpr uint8_t MODE_COUNT = MAX_LAYERS + 1;
 constexpr uint8_t NO_TRIGGER = 0xFF;
+constexpr uint8_t MAX_MAPPING_KEYS = 3;
 
 struct Mapping {
     uint8_t modifier;
-    uint8_t keycode;
+    uint8_t keys[MAX_MAPPING_KEYS];
 };
+
+static_assert(sizeof(Mapping) == 4, "Mapping storage format must remain packed");
+
+inline Mapping singleKeyMapping(uint8_t modifier, uint8_t keycode) {
+    Mapping mapping = {modifier, {keycode, 0, 0}};
+    if (keycode == 0) mapping.modifier = 0;
+    return mapping;
+}
+
+inline void expandSingleKeyMappings(const uint8_t* source, Mapping* destination,
+                                    size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        destination[i] = singleKeyMapping(source[i * 2], source[i * 2 + 1]);
+    }
+}
+
+inline uint8_t mappingKeyCount(const Mapping& mapping) {
+    uint8_t count = 0;
+    while (count < MAX_MAPPING_KEYS && mapping.keys[count] != 0) ++count;
+    return count;
+}
+
+inline bool mappingContainsKey(const Mapping& mapping, uint8_t keycode) {
+    for (uint8_t i = 0; i < mappingKeyCount(mapping); ++i) {
+        if (mapping.keys[i] == keycode) return true;
+    }
+    return false;
+}
 
 struct DebounceState {
     bool raw;
@@ -47,12 +76,23 @@ inline bool containsKey(const KeyboardReport& report, uint8_t keycode) {
     return false;
 }
 
-inline void addMapping(KeyboardReport& report, const Mapping& mapping) {
-    report.modifiers |= mapping.modifier;
-    if (mapping.keycode != 0 && !containsKey(report, mapping.keycode) &&
-        report.count < 6) {
-        report.keys[report.count++] = mapping.keycode;
+inline bool canAddMapping(const KeyboardReport& report, const Mapping& mapping) {
+    uint8_t required = 0;
+    for (uint8_t i = 0; i < mappingKeyCount(mapping); ++i) {
+        if (!containsKey(report, mapping.keys[i])) ++required;
     }
+    return report.count + required <= 6;
+}
+
+inline bool addMapping(KeyboardReport& report, const Mapping& mapping) {
+    if (!canAddMapping(report, mapping)) return false;
+    report.modifiers |= mapping.modifier;
+    for (uint8_t i = 0; i < mappingKeyCount(mapping); ++i) {
+        if (!containsKey(report, mapping.keys[i])) {
+            report.keys[report.count++] = mapping.keys[i];
+        }
+    }
+    return true;
 }
 
 inline KeyboardReport composeReport(const Mapping activeMappings[],

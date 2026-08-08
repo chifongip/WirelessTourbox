@@ -8,7 +8,7 @@ A compact USB macro controller inspired by the [TourBox](https://tourboxtech.com
 - **USB HID keyboard:** Plug-and-play, no drivers needed on Linux, macOS, or Windows
 - **Persistent key mappings:** Stored in EEPROM, survives power cycles
 - **Runtime remapping:** Change key bindings via GUI tool or serial commands
-- **Key combinations:** Supports modifier keys (Ctrl, Shift, Alt, GUI) + any keycode
+- **Compound shortcuts:** Supports any modifiers plus up to three simultaneous keys, such as Ctrl+A+B
 - **Hold layers:** Hold any configured physical switch to remap every switch and encoder
 - **Default mappings:** F13–F22 (easily remappable to any HID keycode)
 - **Native GUI:** Cross-platform config tool (Windows, macOS, Linux)
@@ -123,6 +123,7 @@ wireless-tourbox-config.exe      # Windows
 - Edit Base and layer mappings in separate tabs; assign **No Action** where needed
 - Click "Edit" to choose or capture a mapping
 - Categorized key picker plus optional live key capture
+- Hardware-driven layer navigation and highlighted mapping rows
 - Duplicate mapping warnings (duplicates can be confirmed)
 - Responsive mapping layout with native window maximize support
 - Reset Base to F13–F22 and clear all layers
@@ -130,10 +131,11 @@ wireless-tourbox-config.exe      # Windows
 
 **Supported key combinations:**
 - Single keys: A-Z, 0-9, F1-F24, symbols (`,./;'[]\-=`)
-- Shift+key: Shift+A, Shift+F1, etc.
-- Ctrl+key: Ctrl+C, Ctrl+Z, Ctrl+A, etc.
-- Alt+key: Alt+A, Alt+F1, etc.
+- Modifier chords: Ctrl+Alt+Delete, Ctrl+Shift+A, etc.
+- Compound chords: A+B+C, Ctrl+A+B, or Ctrl+Shift+A+B+C
 - Windows/Super mappings are available through the modifier picker even when the OS intercepts live capture
+
+Mappings contain at most three regular keys plus any modifier bits. Operating systems may reserve shortcuts such as Ctrl+Alt+Delete even though the controller sends them correctly.
 
 **Build from source:**
 ```bash
@@ -205,7 +207,9 @@ The device exposes a CDC serial interface for runtime configuration:
 | `GET_LAYOUT:[layer]` | `mod:key,mod:key,...` | Returns mappings for Base (`0`) or an enabled layer |
 | `SET_KEY:[idx]:[mod]:[key]` | `OK` or `ERR` | Updates a Base mapping (legacy-compatible) |
 | `SET_KEY:[layer]:[idx]:[mod]:[key]` | `OK` or `ERR` | Updates a mapping in an enabled layer |
-| `GET_INFO` | `INFO:WirelessTourbox:2` | Identifies the device and protocol version |
+| `GET_CHORDS:[layer]` | `mod:key+key,...` | Returns complete compound mappings for a layer |
+| `SET_CHORD:[layer]:[idx]:[mod]:[keys]` | `OK` or `ERR` | Sets one to three `+`-separated keycodes, or `0` for No Action |
+| `GET_INFO` | `INFO:WirelessTourbox:3` | Identifies the device and protocol version |
 | `GET_CAPS` / `GET_INPUTS` | `CAPS:...` / `INPUTS:...` | Describes limits and firmware-defined inputs |
 | `GET_LAYER_CONFIG` | `LAYERCFG:[ms]:[layer]=[trigger],...` | Returns hold timing and enabled layers |
 | `SET_LAYER:[layer]:[trigger]` | `OK` or `ERR` | Creates a layer or changes its trigger switch |
@@ -219,6 +223,9 @@ The device exposes a CDC serial interface for runtime configuration:
 0:104,0:105,0:106,0:107,0:108,0:109,0:110,0:111,0:112,0:113
 
 > SET_KEY:0:1:26     # Remap Switch 1 to Ctrl+Z
+OK
+
+> SET_CHORD:0:1:5:4+5  # Switch 2 sends Ctrl+Alt+A+B
 OK
 ```
 
