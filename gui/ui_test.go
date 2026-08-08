@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -183,5 +184,26 @@ func TestRowHighlightUsesSeparateIndicatorCell(t *testing.T) {
 	}
 	if label.Position().X < rowHighlightWidth || label.Size().Width == 0 {
 		t.Fatalf("content overlaps indicator: position=%v size=%v", label.Position(), label.Size())
+	}
+}
+
+func TestConfigChangeCompletionRunsAfterRebuild(t *testing.T) {
+	testApp := fynetest.NewApp()
+	defer testApp.Quit()
+	ui := NewApp(testApp.NewWindow("Config completion test"), &Device{})
+	ui.BuildUI()
+	defer ui.Close()
+
+	completed := make(chan struct{})
+	ui.runConfigChangeWithCompletion("Updating…", 0, func() error { return nil }, func() {
+		close(completed)
+	})
+	select {
+	case <-completed:
+		if ui.mappingTabs == nil || ui.selectedLayer != 0 {
+			t.Fatal("completion ran before the mapping view was rebuilt")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("config change completion was not called")
 	}
 }

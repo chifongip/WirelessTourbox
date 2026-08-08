@@ -702,8 +702,12 @@ func (a *App) showLayerManager() {
 				if !ok {
 					return
 				}
+				targetLayer := a.selectedLayer
+				if targetLayer == definition.Slot {
+					targetLayer = 0
+				}
 				manager.Hide()
-				a.runConfigChange("Removing layer…", 0, func() error {
+				a.runLayerManagerChange("Removing layer…", targetLayer, func() error {
 					return a.device.RemoveLayer(definition.Slot)
 				})
 			}, a.window)
@@ -763,7 +767,7 @@ func (a *App) showLayerManager() {
 			return
 		}
 		manager.Hide()
-		a.runConfigChange("Adding layer…", slot, func() error { return a.device.SetLayer(slot, trigger) })
+		a.runLayerManagerChange("Adding layer…", slot, func() error { return a.device.SetLayer(slot, trigger) })
 	})
 	if len(eligibleNames) == 0 || len(config.Layers) >= caps.MaxLayers {
 		triggerSelect.Disable()
@@ -802,16 +806,32 @@ func (a *App) showLayerManager() {
 }
 
 func (a *App) runConfigChange(status string, targetLayer int, operation func() error) {
+	a.runConfigChangeWithCompletion(status, targetLayer, operation, nil)
+}
+
+func (a *App) runLayerManagerChange(status string, targetLayer int, operation func() error) {
+	a.runConfigChangeWithCompletion(status, targetLayer, operation, func() {
+		if a.device.IsConnected() && a.device.ProtocolVersion() >= 2 {
+			a.showLayerManager()
+		}
+	})
+}
+
+func (a *App) runConfigChangeWithCompletion(status string, targetLayer int, operation func() error, completed func()) {
 	a.setBusy(true, status)
 	go func() {
 		err := operation()
 		fyne.Do(func() {
-			if err != nil {
-				dialog.ShowError(err, a.window)
-			} else {
+			if err == nil {
 				a.rebuildMappings(targetLayer)
 			}
 			a.setBusy(false, connectedStatus(a.device))
+			if completed != nil {
+				completed()
+			}
+			if err != nil {
+				dialog.ShowError(err, a.window)
+			}
 		})
 	}()
 }
