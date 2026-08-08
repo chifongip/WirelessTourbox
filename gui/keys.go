@@ -133,6 +133,7 @@ const (
 
 // HIDNames maps HID keycodes to human-readable names.
 var HIDNames = map[uint8]string{
+	0x00: "No Action",
 	0x04: "A", 0x05: "B", 0x06: "C", 0x07: "D", 0x08: "E",
 	0x09: "F", 0x0A: "G", 0x0B: "H", 0x0C: "I", 0x0D: "J",
 	0x0E: "K", 0x0F: "L", 0x10: "M", 0x11: "N", 0x12: "O",
@@ -260,6 +261,9 @@ var ShiftedRuneToHID = map[rune]uint8{
 
 // FormatKey returns a human-readable string for a modifier+keycode combination.
 func FormatKey(mod, keycode uint8) string {
+	if keycode == 0 {
+		return "No Action"
+	}
 	name, ok := HIDNames[keycode]
 	if !ok {
 		name = fmt.Sprintf("0x%02X", keycode)
@@ -284,7 +288,7 @@ func ModifierString(mod uint8) string {
 	return strings.Join(parts, "+")
 }
 
-var KeyCategories = []string{"Letters", "Numbers", "Symbols", "Editing", "Navigation", "Function", "Keypad"}
+var KeyCategories = []string{"Actions", "Letters", "Numbers", "Symbols", "Editing", "Navigation", "Function", "Keypad"}
 
 // KeyChoices returns stable, keycode-ordered names for a picker category.
 func KeyChoices(category string) []string {
@@ -308,6 +312,8 @@ func KeyChoices(category string) []string {
 
 func KeyCategory(code uint8) string {
 	switch {
+	case code == 0:
+		return "Actions"
 	case code >= HID_KEY_A && code <= HID_KEY_Z:
 		return "Letters"
 	case code >= HID_KEY_1 && code <= HID_KEY_0:

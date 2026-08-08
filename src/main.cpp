@@ -1,4 +1,4 @@
-// WirelessTourbox — HID Keyboard + CDC Serial + EEPROM Config
+// WirelessTourbox — layered HID keyboard + CDC serial configuration
 
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
@@ -7,13 +7,23 @@
 
 constexpr uint8_t NUM_INPUTS = 10;
 constexpr uint8_t NUM_SWITCHES = 6;
-constexpr uint16_t EEPROM_SIZE = 21;
-constexpr uint8_t EEPROM_MAGIC = 0xA5;
 constexpr uint8_t STEPS_PER_DETENT = 4;
-constexpr unsigned long DEBOUNCE_MS = 5;
-constexpr unsigned long PULSE_MS = 8;
-constexpr unsigned long PULSE_GAP_MS = 2;
+constexpr uint32_t DEBOUNCE_MS = 5;
+constexpr uint32_t PULSE_MS = 8;
+constexpr uint32_t PULSE_GAP_MS = 2;
 constexpr uint8_t PULSE_QUEUE_SIZE = 32;
+constexpr uint16_t DEFAULT_HOLD_MS = 200;
+constexpr uint16_t MIN_HOLD_MS = 100;
+constexpr uint16_t MAX_HOLD_MS = 1000;
+
+constexpr uint16_t STORAGE_MAGIC = 0x5742;
+constexpr uint8_t STORAGE_SCHEMA = 2;
+constexpr uint8_t LEGACY_MAGIC = 0xA5;
+constexpr uint16_t HEADER_SIZE = 21;
+constexpr uint16_t MAPPINGS_SIZE =
+    tourbox::MODE_COUNT * tourbox::MAX_INPUTS * sizeof(tourbox::Mapping);
+constexpr uint16_t CRC_OFFSET = HEADER_SIZE + MAPPINGS_SIZE;
+constexpr uint16_t EEPROM_SIZE = CRC_OFFSET + 2;
 
 constexpr uint8_t SW1_PIN = 2;
 constexpr uint8_t SW2_PIN = 3;
@@ -26,15 +36,33 @@ constexpr uint8_t ENC2_A_PIN = 10;
 constexpr uint8_t ENC2_B_PIN = 11;
 constexpr uint8_t ENC2_BTN_PIN = 12;
 
-uint8_t const desc_hid_report[] = {TUD_HID_REPORT_DESC_KEYBOARD()};
-Adafruit_USBD_HID usb_hid;
+struct InputDescriptor {
+    const char* name;
+    char kind;
+    bool layerEligible;
+};
 
-uint8_t config[NUM_INPUTS][2];
-const uint8_t defaultConfig[NUM_INPUTS][2] = {
+const InputDescriptor inputDescriptors[NUM_INPUTS] = {
+    {"Switch_1", 'S', true},       {"Switch_2", 'S', true},
+    {"Switch_3", 'S', true},       {"Switch_4", 'S', true},
+    {"Encoder_1_Click", 'B', false}, {"Encoder_2_Click", 'B', false},
+    {"Encoder_1_CW", 'E', false},  {"Encoder_1_CCW", 'E', false},
+    {"Encoder_2_CW", 'E', false},  {"Encoder_2_CCW", 'E', false},
+};
+
+const tourbox::Mapping defaultMappings[NUM_INPUTS] = {
     {0x00, 0x68}, {0x00, 0x69}, {0x00, 0x6A}, {0x00, 0x6B},
     {0x00, 0x6C}, {0x00, 0x6D}, {0x00, 0x6E}, {0x00, 0x6F},
     {0x00, 0x70}, {0x00, 0x71},
 };
+
+uint8_t const desc_hid_report[] = {TUD_HID_REPORT_DESC_KEYBOARD()};
+Adafruit_USBD_HID usb_hid;
+
+tourbox::Mapping mappings[tourbox::MODE_COUNT][tourbox::MAX_INPUTS];
+uint8_t layerTriggers[tourbox::MAX_LAYERS];
+uint16_t holdMs = DEFAULT_HOLD_MS;
+tourbox::LayerState layerState;
 
 volatile int32_t encoder1Pos = 0;
 volatile uint8_t encoder1Last = 0;
@@ -55,26 +83,31 @@ struct SwitchState {
 };
 
 SwitchState switches[NUM_SWITCHES] = {
-    {SW1_PIN, 0, {HIGH, HIGH, 0}},
-    {SW2_PIN, 1, {HIGH, HIGH, 0}},
-    {SW3_PIN, 2, {HIGH, HIGH, 0}},
-    {SW4_PIN, 3, {HIGH, HIGH, 0}},
+    {SW1_PIN, 0, {HIGH, HIGH, 0}}, {SW2_PIN, 1, {HIGH, HIGH, 0}},
+    {SW3_PIN, 2, {HIGH, HIGH, 0}}, {SW4_PIN, 3, {HIGH, HIGH, 0}},
     {ENC1_BTN_PIN, 4, {HIGH, HIGH, 0}},
     {ENC2_BTN_PIN, 5, {HIGH, HIGH, 0}},
 };
 
 bool switchActive[NUM_SWITCHES] = {false};
-uint8_t pulseQueue[PULSE_QUEUE_SIZE];
+tourbox::Mapping activeMappings[NUM_SWITCHES];
+
+struct PulseEvent {
+    uint8_t index;
+    tourbox::Mapping mapping;
+};
+
+PulseEvent pulseQueue[PULSE_QUEUE_SIZE];
 uint8_t pulseHead = 0;
 uint8_t pulseTail = 0;
 uint8_t pulseCount = 0;
 bool pulseActive = false;
-uint8_t pulseIndex = 0;
-unsigned long pulseReleaseAt = 0;
-unsigned long pulseGapUntil = 0;
+PulseEvent activePulse = {0, {0, 0}};
+uint32_t pulseReleaseAt = 0;
+uint32_t pulseGapUntil = 0;
 bool reportDirty = true;
 
-constexpr uint8_t CMD_BUF_SIZE = 64;
+constexpr uint8_t CMD_BUF_SIZE = 96;
 char cmdBuf[CMD_BUF_SIZE];
 uint8_t cmdLen = 0;
 bool cmdOverflow = false;
@@ -91,77 +124,141 @@ void encoder2ISR() {
     encoder2Last = state;
 }
 
-void loadConfig() {
-    EEPROM.begin(EEPROM_SIZE);
-    if (EEPROM.read(0) != EEPROM_MAGIC) {
-        EEPROM.write(0, EEPROM_MAGIC);
-        for (uint8_t i = 0; i < NUM_INPUTS; ++i) {
-            EEPROM.write(1 + i * 2, defaultConfig[i][0]);
-            EEPROM.write(2 + i * 2, defaultConfig[i][1]);
-        }
-        EEPROM.commit();
-    }
-    for (uint8_t i = 0; i < NUM_INPUTS; ++i) {
-        config[i][0] = EEPROM.read(1 + i * 2);
-        config[i][1] = EEPROM.read(2 + i * 2);
-    }
+void setDefaults() {
+    memset(mappings, 0, sizeof(mappings));
+    for (uint8_t i = 0; i < NUM_INPUTS; ++i) mappings[0][i] = defaultMappings[i];
+    memset(layerTriggers, tourbox::NO_TRIGGER, sizeof(layerTriggers));
+    holdMs = DEFAULT_HOLD_MS;
 }
 
 void saveConfig() {
-    EEPROM.write(0, EEPROM_MAGIC);
-    for (uint8_t i = 0; i < NUM_INPUTS; ++i) {
-        EEPROM.write(1 + i * 2, config[i][0]);
-        EEPROM.write(2 + i * 2, config[i][1]);
-    }
+    uint8_t image[EEPROM_SIZE];
+    memset(image, 0, sizeof(image));
+    image[0] = STORAGE_MAGIC & 0xFF;
+    image[1] = STORAGE_MAGIC >> 8;
+    image[2] = STORAGE_SCHEMA;
+    image[3] = NUM_INPUTS;
+    image[4] = holdMs & 0xFF;
+    image[5] = holdMs >> 8;
+    memcpy(image + 6, layerTriggers, tourbox::MAX_LAYERS);
+    memcpy(image + HEADER_SIZE, mappings, MAPPINGS_SIZE);
+    uint16_t crc = tourbox::crc16(image, CRC_OFFSET);
+    image[CRC_OFFSET] = crc & 0xFF;
+    image[CRC_OFFSET + 1] = crc >> 8;
+    for (uint16_t i = 0; i < EEPROM_SIZE; ++i) EEPROM.write(i, image[i]);
     EEPROM.commit();
 }
 
-void resetConfig() {
-    bool changed = false;
-    for (uint8_t i = 0; i < NUM_INPUTS; ++i) {
-        changed |= config[i][0] != defaultConfig[i][0] ||
-                   config[i][1] != defaultConfig[i][1];
-        config[i][0] = defaultConfig[i][0];
-        config[i][1] = defaultConfig[i][1];
-    }
-    if (changed) saveConfig();
-    reportDirty = true;
+bool validTrigger(uint8_t input) {
+    return input < NUM_INPUTS && inputDescriptors[input].layerEligible;
 }
 
-void logKeyEvent(uint8_t index) {
+bool duplicateTrigger(uint8_t slot, uint8_t trigger) {
+    for (uint8_t i = 0; i < tourbox::MAX_LAYERS; ++i) {
+        if (i != slot && layerTriggers[i] == trigger) return true;
+    }
+    return false;
+}
+
+void loadConfig() {
+    EEPROM.begin(EEPROM_SIZE);
+    if (EEPROM.read(0) == LEGACY_MAGIC) {
+        setDefaults();
+        for (uint8_t i = 0; i < NUM_INPUTS; ++i) {
+            mappings[0][i] = {EEPROM.read(1 + i * 2), EEPROM.read(2 + i * 2)};
+        }
+        saveConfig();
+        return;
+    }
+
+    uint8_t image[EEPROM_SIZE];
+    for (uint16_t i = 0; i < EEPROM_SIZE; ++i) image[i] = EEPROM.read(i);
+    uint16_t magic = static_cast<uint16_t>(image[0]) |
+                     (static_cast<uint16_t>(image[1]) << 8);
+    uint16_t storedCrc = static_cast<uint16_t>(image[CRC_OFFSET]) |
+                         (static_cast<uint16_t>(image[CRC_OFFSET + 1]) << 8);
+    if (magic != STORAGE_MAGIC || image[2] != STORAGE_SCHEMA ||
+        storedCrc != tourbox::crc16(image, CRC_OFFSET)) {
+        setDefaults();
+        saveConfig();
+        return;
+    }
+
+    uint8_t storedInputs = image[3];
+    holdMs = static_cast<uint16_t>(image[4]) |
+             (static_cast<uint16_t>(image[5]) << 8);
+    if (holdMs < MIN_HOLD_MS || holdMs > MAX_HOLD_MS) holdMs = DEFAULT_HOLD_MS;
+    memcpy(layerTriggers, image + 6, tourbox::MAX_LAYERS);
+    memcpy(mappings, image + HEADER_SIZE, MAPPINGS_SIZE);
+    bool sanitized = false;
+    for (uint8_t slot = 0; slot < tourbox::MAX_LAYERS; ++slot) {
+        if (layerTriggers[slot] != tourbox::NO_TRIGGER &&
+            (!validTrigger(layerTriggers[slot]) ||
+             duplicateTrigger(slot, layerTriggers[slot]))) {
+            layerTriggers[slot] = tourbox::NO_TRIGGER;
+            memset(mappings[slot + 1], 0, sizeof(mappings[slot + 1]));
+            sanitized = true;
+        }
+    }
+    if (storedInputs < NUM_INPUTS) {
+        for (uint8_t i = storedInputs; i < NUM_INPUTS; ++i) mappings[0][i] = defaultMappings[i];
+        sanitized = true;
+    }
+    if (sanitized) saveConfig();
+}
+
+uint8_t layerForTrigger(uint8_t input) {
+    for (uint8_t slot = 0; slot < tourbox::MAX_LAYERS; ++slot) {
+        if (layerTriggers[slot] == input) return slot + 1;
+    }
+    return 0;
+}
+
+void logKeyEvent(uint8_t index, const tourbox::Mapping& mapping) {
     Serial.print("KEY:");
     Serial.print(index);
     Serial.print(":0x");
-    Serial.print(config[index][0], HEX);
+    Serial.print(mapping.modifier, HEX);
     Serial.print(":0x");
-    Serial.println(config[index][1], HEX);
+    Serial.println(mapping.keycode, HEX);
 }
 
-bool pulseFits(uint8_t index) {
+void logLayer(uint8_t layer, bool active) {
+    Serial.print("LAYER:");
+    Serial.print(layer);
+    Serial.println(active ? ":ON" : ":OFF");
+}
+
+void promotePending(uint8_t input) {
+    if (layerState.promoteForActivity(input)) logLayer(layerState.currentLayer(), true);
+}
+
+bool pulseFits(const tourbox::Mapping& mapping) {
     tourbox::KeyboardReport report = tourbox::composeReport(
-        config, switchActive, NUM_SWITCHES, -1);
-    uint8_t keycode = config[index][1];
-    return keycode == 0 || tourbox::containsKey(report, keycode) || report.count < 6;
+        activeMappings, switchActive, NUM_SWITCHES, nullptr);
+    return mapping.keycode == 0 || tourbox::containsKey(report, mapping.keycode) ||
+           report.count < 6;
 }
 
 void sendCurrentReport() {
     if (!reportDirty || !usb_hid.ready()) return;
+    const tourbox::Mapping* pulse = pulseActive ? &activePulse.mapping : nullptr;
     tourbox::KeyboardReport report = tourbox::composeReport(
-        config, switchActive, NUM_SWITCHES, pulseActive ? pulseIndex : -1);
+        activeMappings, switchActive, NUM_SWITCHES, pulse);
     usb_hid.keyboardReport(0, report.modifiers, report.keys);
     reportDirty = false;
 }
 
-bool enqueuePulse(uint8_t index) {
+bool enqueuePulse(uint8_t index, const tourbox::Mapping& mapping) {
     if (pulseCount == PULSE_QUEUE_SIZE) return false;
-    pulseQueue[pulseTail] = index;
+    pulseQueue[pulseTail] = {index, mapping};
     pulseTail = (pulseTail + 1) % PULSE_QUEUE_SIZE;
     ++pulseCount;
     return true;
 }
 
 void servicePulse() {
-    unsigned long now = millis();
+    uint32_t now = millis();
     if (pulseActive && static_cast<int32_t>(now - pulseReleaseAt) >= 0) {
         pulseActive = false;
         pulseGapUntil = now + PULSE_GAP_MS;
@@ -169,27 +266,60 @@ void servicePulse() {
     }
     if (!pulseActive && pulseCount > 0 &&
         static_cast<int32_t>(now - pulseGapUntil) >= 0 &&
-        pulseFits(pulseQueue[pulseHead])) {
-        pulseIndex = pulseQueue[pulseHead];
+        pulseFits(pulseQueue[pulseHead].mapping)) {
+        activePulse = pulseQueue[pulseHead];
         pulseHead = (pulseHead + 1) % PULSE_QUEUE_SIZE;
         --pulseCount;
         pulseActive = true;
         pulseReleaseAt = now + PULSE_MS;
         reportDirty = true;
-        logKeyEvent(pulseIndex);
+        logKeyEvent(activePulse.index, activePulse.mapping);
+    }
+}
+
+void pressSwitch(uint8_t switchSlot) {
+    uint8_t input = switches[switchSlot].index;
+    promotePending(input);
+    uint8_t triggerLayer = layerForTrigger(input);
+    if (layerState.currentLayer() == 0 && triggerLayer != 0 &&
+        layerState.beginTrigger(input, triggerLayer, millis())) {
+        return;
+    }
+    activeMappings[switchSlot] = mappings[layerState.currentLayer()][input];
+    switchActive[switchSlot] = true;
+    reportDirty = true;
+    logKeyEvent(input, activeMappings[switchSlot]);
+}
+
+void releaseSwitch(uint8_t switchSlot) {
+    uint8_t input = switches[switchSlot].index;
+    tourbox::LayerRelease release = layerState.release(input);
+    if (release == tourbox::LayerRelease::Tap) {
+        enqueuePulse(input, mappings[0][input]);
+    } else if (release == tourbox::LayerRelease::Deactivated) {
+        uint8_t layer = layerForTrigger(input);
+        logLayer(layer, false);
+    } else if (switchActive[switchSlot]) {
+        switchActive[switchSlot] = false;
+        reportDirty = true;
     }
 }
 
 void pollSwitches() {
-    unsigned long now = millis();
+    uint32_t now = millis();
+    if (layerState.update(now, holdMs)) logLayer(layerState.currentLayer(), true);
     for (uint8_t i = 0; i < NUM_SWITCHES; ++i) {
         bool state = digitalRead(switches[i].pin);
         if (tourbox::updateDebounce(switches[i].debounce, state, now, DEBOUNCE_MS)) {
-            switchActive[i] = switches[i].debounce.stable == LOW;
-            reportDirty = true;
-            if (switchActive[i]) logKeyEvent(switches[i].index);
+            if (switches[i].debounce.stable == LOW) pressSwitch(i);
+            else releaseSwitch(i);
         }
     }
+}
+
+bool enqueueEncoder(uint8_t input) {
+    promotePending(input);
+    return enqueuePulse(input, mappings[layerState.currentLayer()][input]);
 }
 
 void checkEncoders() {
@@ -199,54 +329,155 @@ void checkEncoders() {
     int32_t enc1 = encoder1Pos;
     int32_t enc2 = encoder2Pos;
     interrupts();
-
-    while (enc1 - enc1Reported >= STEPS_PER_DETENT && enqueuePulse(6)) {
-        enc1Reported += STEPS_PER_DETENT;
-    }
-    while (enc1 - enc1Reported <= -STEPS_PER_DETENT && enqueuePulse(7)) {
-        enc1Reported -= STEPS_PER_DETENT;
-    }
-    while (enc2 - enc2Reported >= STEPS_PER_DETENT && enqueuePulse(8)) {
-        enc2Reported += STEPS_PER_DETENT;
-    }
-    while (enc2 - enc2Reported <= -STEPS_PER_DETENT && enqueuePulse(9)) {
-        enc2Reported -= STEPS_PER_DETENT;
-    }
+    while (enc1 - enc1Reported >= STEPS_PER_DETENT && enqueueEncoder(6)) enc1Reported += STEPS_PER_DETENT;
+    while (enc1 - enc1Reported <= -STEPS_PER_DETENT && enqueueEncoder(7)) enc1Reported -= STEPS_PER_DETENT;
+    while (enc2 - enc2Reported >= STEPS_PER_DETENT && enqueueEncoder(8)) enc2Reported += STEPS_PER_DETENT;
+    while (enc2 - enc2Reported <= -STEPS_PER_DETENT && enqueueEncoder(9)) enc2Reported -= STEPS_PER_DETENT;
 }
 
-void printLayout() {
+void printLayout(uint8_t layer) {
     for (uint8_t i = 0; i < NUM_INPUTS; ++i) {
         if (i > 0) Serial.print(',');
-        Serial.print(config[i][0]);
+        Serial.print(mappings[layer][i].modifier);
         Serial.print(':');
-        Serial.print(config[i][1]);
+        Serial.print(mappings[layer][i].keycode);
     }
     Serial.println();
 }
 
+void printInputs() {
+    Serial.print("INPUTS:");
+    for (uint8_t i = 0; i < NUM_INPUTS; ++i) {
+        if (i > 0) Serial.print('|');
+        Serial.print(i);
+        Serial.print(':');
+        Serial.print(inputDescriptors[i].kind);
+        Serial.print(':');
+        Serial.print(inputDescriptors[i].layerEligible ? 1 : 0);
+        Serial.print(':');
+        Serial.print(inputDescriptors[i].name);
+    }
+    Serial.println();
+}
+
+void printLayerConfig() {
+    Serial.print("LAYERCFG:");
+    Serial.print(holdMs);
+    Serial.print(':');
+    bool first = true;
+    for (uint8_t slot = 0; slot < tourbox::MAX_LAYERS; ++slot) {
+        if (layerTriggers[slot] == tourbox::NO_TRIGGER) continue;
+        if (!first) Serial.print(',');
+        Serial.print(slot + 1);
+        Serial.print('=');
+        Serial.print(layerTriggers[slot]);
+        first = false;
+    }
+    Serial.println();
+}
+
+bool parseExact(const char* text, int& a, int& b, int& c) {
+    char trailing;
+    return sscanf(text, "%d:%d:%d%c", &a, &b, &c, &trailing) == 3;
+}
+
+bool parseExact(const char* text, int& a, int& b, int& c, int& d) {
+    char trailing;
+    return sscanf(text, "%d:%d:%d:%d%c", &a, &b, &c, &d, &trailing) == 4;
+}
+
+void setMappingCommand(uint8_t layer, int index, int modifier, int keycode) {
+    if (layer >= tourbox::MODE_COUNT || index < 0 || index >= NUM_INPUTS ||
+        modifier < 0 || modifier > 255 || keycode < 0 || keycode > 255) {
+        Serial.println("ERR:RANGE");
+        return;
+    }
+    if (layer > 0 && layerTriggers[layer - 1] == tourbox::NO_TRIGGER) {
+        Serial.println("ERR:DISABLED");
+        return;
+    }
+    tourbox::Mapping next = {static_cast<uint8_t>(modifier), static_cast<uint8_t>(keycode)};
+    if (mappings[layer][index].modifier != next.modifier ||
+        mappings[layer][index].keycode != next.keycode) {
+        mappings[layer][index] = next;
+        saveConfig();
+    }
+    reportDirty = true;
+    Serial.println("OK");
+}
+
+void resetConfig() {
+    setDefaults();
+    layerState.reset();
+    saveConfig();
+    reportDirty = true;
+}
+
 void processCommand(const char* cmd) {
     if (strcmp(cmd, "GET_INFO") == 0) {
-        Serial.println("INFO:WirelessTourbox:1");
+        Serial.println("INFO:WirelessTourbox:2");
+    } else if (strcmp(cmd, "GET_CAPS") == 0) {
+        Serial.print("CAPS:2:");
+        Serial.print(NUM_INPUTS);
+        Serial.print(':');
+        Serial.println(tourbox::MAX_LAYERS);
+    } else if (strcmp(cmd, "GET_INPUTS") == 0) {
+        printInputs();
+    } else if (strcmp(cmd, "GET_LAYER_CONFIG") == 0) {
+        printLayerConfig();
     } else if (strcmp(cmd, "GET_LAYOUT") == 0) {
-        printLayout();
+        printLayout(0);
+    } else if (strncmp(cmd, "GET_LAYOUT:", 11) == 0) {
+        int layer;
+        char trailing;
+        if (sscanf(cmd + 11, "%d%c", &layer, &trailing) != 1) Serial.println("ERR:PARSE");
+        else if (layer < 0 || layer >= tourbox::MODE_COUNT) Serial.println("ERR:RANGE");
+        else if (layer > 0 && layerTriggers[layer - 1] == tourbox::NO_TRIGGER) Serial.println("ERR:DISABLED");
+        else printLayout(layer);
     } else if (strcmp(cmd, "RESET_DEFAULTS") == 0) {
         resetConfig();
         Serial.println("OK");
     } else if (strncmp(cmd, "SET_KEY:", 8) == 0) {
-        int idx, mod, key;
-        char trailing;
-        if (sscanf(cmd + 8, "%d:%d:%d%c", &idx, &mod, &key, &trailing) != 3) {
-            Serial.println("ERR:PARSE");
-        } else if (idx < 0 || idx >= NUM_INPUTS || mod < 0 || mod > 255 ||
-                   key < 0 || key > 255) {
-            Serial.println("ERR:RANGE");
+        int layer, index, modifier, keycode;
+        if (parseExact(cmd + 8, layer, index, modifier, keycode)) {
+            setMappingCommand(layer, index, modifier, keycode);
+        } else if (parseExact(cmd + 8, index, modifier, keycode)) {
+            setMappingCommand(0, index, modifier, keycode);
         } else {
-            bool changed = config[idx][0] != static_cast<uint8_t>(mod) ||
-                           config[idx][1] != static_cast<uint8_t>(key);
-            config[idx][0] = static_cast<uint8_t>(mod);
-            config[idx][1] = static_cast<uint8_t>(key);
-            if (changed) saveConfig();
-            reportDirty = true;
+            Serial.println("ERR:PARSE");
+        }
+    } else if (strncmp(cmd, "SET_LAYER:", 10) == 0) {
+        int layer, trigger;
+        char trailing;
+        if (sscanf(cmd + 10, "%d:%d%c", &layer, &trigger, &trailing) != 2) Serial.println("ERR:PARSE");
+        else if (layer < 1 || layer > tourbox::MAX_LAYERS || trigger < 0 || trigger >= NUM_INPUTS) Serial.println("ERR:RANGE");
+        else if (!validTrigger(trigger)) Serial.println("ERR:INELIGIBLE");
+        else if (duplicateTrigger(layer - 1, trigger)) Serial.println("ERR:DUPLICATE");
+        else {
+            if (layerTriggers[layer - 1] == tourbox::NO_TRIGGER) memset(mappings[layer], 0, sizeof(mappings[layer]));
+            layerTriggers[layer - 1] = trigger;
+            saveConfig();
+            Serial.println("OK");
+        }
+    } else if (strncmp(cmd, "REMOVE_LAYER:", 13) == 0) {
+        int layer;
+        char trailing;
+        if (sscanf(cmd + 13, "%d%c", &layer, &trailing) != 1) Serial.println("ERR:PARSE");
+        else if (layer < 1 || layer > tourbox::MAX_LAYERS) Serial.println("ERR:RANGE");
+        else {
+            layerTriggers[layer - 1] = tourbox::NO_TRIGGER;
+            memset(mappings[layer], 0, sizeof(mappings[layer]));
+            saveConfig();
+            Serial.println("OK");
+        }
+    } else if (strncmp(cmd, "SET_HOLD_MS:", 12) == 0) {
+        int value;
+        char trailing;
+        if (sscanf(cmd + 12, "%d%c", &value, &trailing) != 1) Serial.println("ERR:PARSE");
+        else if (value < MIN_HOLD_MS || value > MAX_HOLD_MS) Serial.println("ERR:RANGE");
+        else {
+            holdMs = value;
+            saveConfig();
             Serial.println("OK");
         }
     } else {
@@ -258,9 +489,8 @@ void readSerial() {
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
-            if (cmdOverflow) {
-                Serial.println("ERR:TOO_LONG");
-            } else if (cmdLen > 0) {
+            if (cmdOverflow) Serial.println("ERR:TOO_LONG");
+            else if (cmdLen > 0) {
                 cmdBuf[cmdLen] = '\0';
                 processCommand(cmdBuf);
             }
@@ -277,13 +507,11 @@ void readSerial() {
 void setup() {
     if (!TinyUSBDevice.isInitialized()) TinyUSBDevice.begin(0);
     Serial.begin(115200);
-
     usb_hid.setPollInterval(2);
     usb_hid.setBootProtocol(HID_ITF_PROTOCOL_KEYBOARD);
     usb_hid.setReportDescriptor(desc_hid_report, sizeof(desc_hid_report));
     usb_hid.setStringDescriptor("WirelessTourbox");
     usb_hid.begin();
-
     if (TinyUSBDevice.mounted()) {
         TinyUSBDevice.detach();
         delay(10);
@@ -295,9 +523,9 @@ void setup() {
         pinMode(switches[i].pin, INPUT_PULLUP);
         bool initial = digitalRead(switches[i].pin);
         switches[i].debounce = {initial, initial, millis()};
-        switchActive[i] = initial == LOW;
+        switchActive[i] = false;
+        activeMappings[i] = {0, 0};
     }
-
     pinMode(ENC1_A_PIN, INPUT_PULLUP);
     pinMode(ENC1_B_PIN, INPUT_PULLUP);
     pinMode(ENC2_A_PIN, INPUT_PULLUP);
@@ -308,7 +536,6 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(ENC1_B_PIN), encoder1ISR, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC2_A_PIN), encoder2ISR, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC2_B_PIN), encoder2ISR, CHANGE);
-
     Serial.println("WirelessTourbox ready");
 }
 

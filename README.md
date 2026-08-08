@@ -9,6 +9,7 @@ A compact USB macro controller inspired by the [TourBox](https://tourboxtech.com
 - **Persistent key mappings:** Stored in EEPROM, survives power cycles
 - **Runtime remapping:** Change key bindings via GUI tool or serial commands
 - **Key combinations:** Supports modifier keys (Ctrl, Shift, Alt, GUI) + any keycode
+- **Hold layers:** Hold any configured physical switch to remap every switch and encoder
 - **Default mappings:** F13–F22 (easily remappable to any HID keycode)
 - **Native GUI:** Cross-platform config tool (Windows, macOS, Linux)
 
@@ -118,11 +119,13 @@ wireless-tourbox-config.exe      # Windows
 **Features:**
 - Connect to device via serial port dropdown
 - View all 10 inputs with current key mappings
+- Add independent switch-held layers and tune the 100–1000 ms hold threshold
+- Edit Base and layer mappings in separate tabs; assign **No Action** where needed
 - Click "Edit" to choose or capture a mapping
 - Categorized key picker plus optional live key capture
 - Duplicate mapping warnings (duplicates can be confirmed)
 - Responsive mapping layout with native window maximize support
-- Reset all keys to defaults (F13-F22)
+- Reset Base to F13–F22 and clear all layers
 - Fixed-height live monitor showing input events in real time
 
 **Supported key combinations:**
@@ -166,6 +169,8 @@ sudo apt install -y gcc-mingw-w64-x86-64  # for Windows cross-compilation
 
 Python-based terminal UI for viewing and remapping key bindings:
 
+The terminal tool intentionally edits the Base layout only. Use the GUI to create and edit hold layers.
+
 ```bash
 python3 config_tool.py
 ```
@@ -196,10 +201,17 @@ The device exposes a CDC serial interface for runtime configuration:
 
 | Command | Response | Description |
 |---------|----------|-------------|
-| `GET_LAYOUT` | `mod:key,mod:key,...` | Returns current 10 key mappings (decimal) |
-| `SET_KEY:[idx]:[mod]:[key]` | `OK` or `ERR` | Updates key at index, persists to EEPROM |
-| `GET_INFO` | `INFO:WirelessTourbox:1` | Identifies the device and protocol version |
-| `RESET_DEFAULTS` | `OK` | Atomically restores F13–F22 defaults |
+| `GET_LAYOUT` | `mod:key,mod:key,...` | Returns the Base mappings (legacy-compatible) |
+| `GET_LAYOUT:[layer]` | `mod:key,mod:key,...` | Returns mappings for Base (`0`) or an enabled layer |
+| `SET_KEY:[idx]:[mod]:[key]` | `OK` or `ERR` | Updates a Base mapping (legacy-compatible) |
+| `SET_KEY:[layer]:[idx]:[mod]:[key]` | `OK` or `ERR` | Updates a mapping in an enabled layer |
+| `GET_INFO` | `INFO:WirelessTourbox:2` | Identifies the device and protocol version |
+| `GET_CAPS` / `GET_INPUTS` | `CAPS:...` / `INPUTS:...` | Describes limits and firmware-defined inputs |
+| `GET_LAYER_CONFIG` | `LAYERCFG:[ms]:[layer]=[trigger],...` | Returns hold timing and enabled layers |
+| `SET_LAYER:[layer]:[trigger]` | `OK` or `ERR` | Creates a layer or changes its trigger switch |
+| `REMOVE_LAYER:[layer]` | `OK` or `ERR` | Removes a layer and clears its mappings |
+| `SET_HOLD_MS:[100-1000]` | `OK` or `ERR` | Sets the tap-versus-hold threshold |
+| `RESET_DEFAULTS` | `OK` | Restores F13–F22, removes layers, and resets hold timing |
 
 **Example:**
 ```
@@ -209,6 +221,8 @@ The device exposes a CDC serial interface for runtime configuration:
 > SET_KEY:0:1:26     # Remap Switch 1 to Ctrl+Z
 OK
 ```
+
+A configured layer switch keeps its Base mapping as its tap action. Holding it past the threshold activates the layer without sending that tap; pressing or rotating another control while it is pending activates the layer immediately. The first layer switch held wins until released. Layer mappings are captured when an action begins, so releasing the trigger does not alter an in-progress press or encoder pulse.
 
 ## Using the Tourbox
 

@@ -19,9 +19,10 @@ A compact, highly tactile desktop macro controller inspired by the TourBox, opti
 - **Encoder 2 (Click Switch):** GPIO 12
 
 ## Memory & Configuration Architecture
-- **Storage:** `EEPROM.h` (Flash emulation on Pico) stores a 21-byte configuration array.
-- **EEPROM Layout:** Byte 0 = magic (0xA5), bytes 1-20 = 10 inputs × 2 bytes (modifier + keycode).
-- **Boot Behavior:** On `setup()`, initialize EEPROM. Read the 21-byte map. If magic byte != 0xA5, write defaults and commit.
+- **Storage:** `EEPROM.h` (Flash emulation on Pico) stores a versioned 1,047-byte image protected by CRC16-CCITT.
+- **Capacity:** 32 input descriptors and 16 mapping tables (Base plus 15 optional layers).
+- **EEPROM Layout:** magic `0x5742`, schema `2`, stored input count, hold threshold, 15 trigger indexes, 16 × 32 modifier/key pairs, then CRC16.
+- **Boot Behavior:** Invalid data restores defaults. The legacy `0xA5`/21-byte layout is migrated automatically, preserving all ten Base mappings while initializing layers to No Action.
 - **USB Architecture:** Composite Device providing both **USB HID Keyboard** and **USB Serial (CDC)** simultaneously via Adafruit TinyUSB.
 - **Communication Protocol:** The firmware listens on the Serial port for configuration commands.
 
@@ -54,13 +55,20 @@ Each input is 2 bytes: [modifier, keycode]. Default mappings use no modifier (0x
 | 7 | 0x80 | Right GUI |
 
 ### Serial Command Spec
-- `GET_LAYOUT` → Returns `mod:key,mod:key,...` (10 pairs, decimal, comma-separated).
-- `SET_KEY:[index]:[modifier]:[keycode]` → Updates modifier and keycode at index, commits to EEPROM, responds `OK`.
-- `GET_INFO` → Returns `INFO:WirelessTourbox:1` for identity and protocol negotiation.
-- `RESET_DEFAULTS` → Restores all defaults with one EEPROM commit and responds `OK`.
+- `GET_LAYOUT` and `SET_KEY:[index]:[modifier]:[keycode]` remain Base-only compatibility commands.
+- `GET_INFO` → `INFO:WirelessTourbox:2`; `GET_CAPS` and `GET_INPUTS` describe runtime limits and inputs.
+- `GET_LAYOUT:[layer]` and `SET_KEY:[layer]:[index]:[modifier]:[keycode]` access layered mappings.
+- `GET_LAYER_CONFIG`, `SET_LAYER`, `REMOVE_LAYER`, and `SET_HOLD_MS` manage tap/hold layers.
+- `RESET_DEFAULTS` restores Base defaults, removes all layers, and restores the 200 ms threshold.
 
 ### Debug Output
 When a key is sent, the firmware echoes: `KEY:<index>:0x<modifier_hex>:0x<keycode_hex>`
+
+Layer transitions echo `LAYER:<layer>:ON|OFF`.
+
+## Tap/Hold Layers
+
+Only firmware-designated physical switches can trigger layers; encoder clicks and directions can still receive layered mappings. A trigger released before the threshold sends its Base mapping. Holding it activates its layer without sending the tap, while operating another control promotes a pending layer immediately. The first trigger held wins, mappings are latched when actions begin, and releasing the trigger only affects future actions.
 
 ## Encoder Details
 - **Type:** EC11 rotary encoder with push button
@@ -76,6 +84,7 @@ When a key is sent, the firmware echoes: `KEY:<index>:0x<modifier_hex>:0x<keycod
 - Live key capture for remapping
 - Duplicate mapping confirmation
 - Categorized key picker with all left/right modifiers
+- Dynamic Base/layer tabs, No Action mappings, and a layer manager
 - Fixed-height real-time input monitor
 - Single-reader serial architecture that separates command responses from `KEY:` debug events
 
