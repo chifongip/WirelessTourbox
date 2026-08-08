@@ -5,6 +5,7 @@ import (
 	"image/color"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
@@ -20,29 +21,47 @@ import (
 )
 
 type App struct {
-	window          fyne.Window
-	device          *Device
-	statusLbl       *widget.Label
-	portSelect      *widget.Select
-	connectBtn      *widget.Button
-	refreshBtn      *widget.Button
-	resetBtn        *widget.Button
-	manageBtn       *widget.Button
-	mappingHost     *fyne.Container
-	mappingTabs     *container.AppTabs
-	tabByLayer      map[int]int
-	layerByTab      []int
-	mappingLists    map[int]*widget.List
-	highlightedRows map[int]int
-	selectedLayer   int
-	monitorLog      *widget.List
-	monEntries      []string
-	busy            bool
-	stopRefresh     chan struct{}
-	closeOnce       sync.Once
+	window                  fyne.Window
+	device                  *Device
+	statusLbl               *widget.Label
+	portSelect              *widget.Select
+	connectBtn              *widget.Button
+	refreshBtn              *widget.Button
+	resetBtn                *widget.Button
+	manageBtn               *widget.Button
+	mappingHost             *fyne.Container
+	mappingTabs             *container.AppTabs
+	tabByLayer              map[int]int
+	layerByTab              []int
+	mappingLists            map[int]*widget.List
+	highlightedRows         map[int]int
+	selectedLayer           int
+	layerManagerList        *widget.List
+	layerManagerRows        map[int]int
+	layerManagerTriggerRows map[int]int
+	monitorLog              *widget.List
+	monEntries              []string
+	busy                    bool
+	stopRefresh             chan struct{}
+	closeOnce               sync.Once
 }
 
 var defaultCompactWindowSize = fyne.NewSize(760, 640)
+
+const (
+	mappingRowHeight   = float32(36)
+	mappingIndexWidth  = float32(42)
+	mappingInputWidth  = float32(190)
+	mappingActionWidth = float32(76)
+	keySlotWidth       = float32(50)
+	keyCategoryWidth   = float32(150)
+	keyActionWidth     = float32(86)
+)
+
+type layerDisplay struct {
+	definition LayerDefinition
+	name       string
+}
 
 func NewApp(window fyne.Window, device *Device) *App {
 	return &App{
@@ -114,6 +133,53 @@ func (a *App) BuildUI() fyne.CanvasObject {
 	return container.NewPadded(content)
 }
 
+func displayLayers(inputs []InputDescriptor, definitions []LayerDefinition) []layerDisplay {
+	layers := make([]layerDisplay, 0, len(definitions))
+	for _, definition := range definitions {
+		name := fmt.Sprintf("Layer %d", definition.Slot)
+		if definition.Trigger >= 0 && definition.Trigger < len(inputs) {
+			name = inputs[definition.Trigger].Name + " Layer"
+		}
+		layers = append(layers, layerDisplay{definition: definition, name: name})
+	}
+	sort.SliceStable(layers, func(i, j int) bool {
+		if layers[i].name == layers[j].name {
+			return layers[i].definition.Slot < layers[j].definition.Slot
+		}
+		return naturalNameLess(layers[i].name, layers[j].name)
+	})
+	return layers
+}
+
+func naturalNameLess(left, right string) bool {
+	leftRunes := []rune(strings.ToLower(left))
+	rightRunes := []rune(strings.ToLower(right))
+	for leftIndex, rightIndex := 0, 0; leftIndex < len(leftRunes) && rightIndex < len(rightRunes); {
+		if unicode.IsDigit(leftRunes[leftIndex]) && unicode.IsDigit(rightRunes[rightIndex]) {
+			leftEnd, rightEnd := leftIndex, rightIndex
+			for leftEnd < len(leftRunes) && unicode.IsDigit(leftRunes[leftEnd]) {
+				leftEnd++
+			}
+			for rightEnd < len(rightRunes) && unicode.IsDigit(rightRunes[rightEnd]) {
+				rightEnd++
+			}
+			leftNumber, _ := strconv.Atoi(string(leftRunes[leftIndex:leftEnd]))
+			rightNumber, _ := strconv.Atoi(string(rightRunes[rightIndex:rightEnd]))
+			if leftNumber != rightNumber {
+				return leftNumber < rightNumber
+			}
+			leftIndex, rightIndex = leftEnd, rightEnd
+			continue
+		}
+		if leftRunes[leftIndex] != rightRunes[rightIndex] {
+			return leftRunes[leftIndex] < rightRunes[rightIndex]
+		}
+		leftIndex++
+		rightIndex++
+	}
+	return len(leftRunes) < len(rightRunes)
+}
+
 func (a *App) rebuildMappings(targetLayer ...int) {
 	if len(targetLayer) > 0 {
 		a.selectedLayer = targetLayer[0]
@@ -129,16 +195,12 @@ func (a *App) rebuildMappings(targetLayer ...int) {
 	tabs := []*container.TabItem{container.NewTabItem("Base", a.mappingTable(0, -1, inputs, layouts[0]))}
 	a.tabByLayer[0] = 0
 	a.layerByTab = append(a.layerByTab, 0)
-	sort.Slice(layerConfig.Layers, func(i, j int) bool { return layerConfig.Layers[i].Slot < layerConfig.Layers[j].Slot })
-	for _, layer := range layerConfig.Layers {
-		name := fmt.Sprintf("Layer %d", layer.Slot)
-		if layer.Trigger >= 0 && layer.Trigger < len(inputs) {
-			name = inputs[layer.Trigger].Name + " Layer"
-		}
-		tabs = append(tabs, container.NewTabItem(name,
-			a.mappingTable(layer.Slot, layer.Trigger, inputs, layouts[layer.Slot])))
-		a.tabByLayer[layer.Slot] = len(tabs) - 1
-		a.layerByTab = append(a.layerByTab, layer.Slot)
+	for _, layer := range displayLayers(inputs, layerConfig.Layers) {
+		definition := layer.definition
+		tabs = append(tabs, container.NewTabItem(layer.name,
+			a.mappingTable(definition.Slot, definition.Trigger, inputs, layouts[definition.Slot])))
+		a.tabByLayer[definition.Slot] = len(tabs) - 1
+		a.layerByTab = append(a.layerByTab, definition.Slot)
 	}
 	appTabs := container.NewAppTabs(tabs...)
 	appTabs.SetTabLocation(container.TabLocationTop)
@@ -177,6 +239,7 @@ func (a *App) mappingTable(layer, trigger int, inputs []InputDescriptor, mapping
 			inputLabel.Truncation = fyne.TextTruncateEllipsis
 			mappingLabel := widget.NewLabel("")
 			mappingLabel.TextStyle = fyne.TextStyle{Monospace: true}
+			mappingLabel.Truncation = fyne.TextTruncateEllipsis
 			button := widget.NewButton("Edit", nil)
 			view := &mappingRowView{index: indexLabel, input: inputLabel,
 				mapping: mappingLabel, button: button}
@@ -229,6 +292,12 @@ type mappingRowView struct {
 	button  *widget.Button
 }
 
+type layerManagerRowView struct {
+	*fyne.Container
+	name   *widget.Label
+	remove *widget.Button
+}
+
 func (a *App) focusMapping(layer, input int) {
 	tab, ok := a.tabByLayer[layer]
 	if !ok || a.mappingTabs == nil {
@@ -244,9 +313,19 @@ func (a *App) focusMapping(layer, input int) {
 }
 
 func mappingRow(index, input, mapping, action fyne.CanvasObject) *fyne.Container {
-	indexCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(42, 36)), index)
-	actionCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(76, 36)), action)
-	return container.NewBorder(nil, nil, indexCell, actionCell, container.NewGridWithColumns(2, input, mapping))
+	indexCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(mappingIndexWidth, mappingRowHeight)), index)
+	inputCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(mappingInputWidth, mappingRowHeight)), input)
+	actionCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(mappingActionWidth, mappingRowHeight)), action)
+	content := container.NewBorder(nil, nil, inputCell, nil, mapping)
+	return container.NewBorder(nil, nil, indexCell, actionCell, content)
+}
+
+func keyEditorRow(slot, category, key, action fyne.CanvasObject) *fyne.Container {
+	slotCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(keySlotWidth, mappingRowHeight)), slot)
+	categoryCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(keyCategoryWidth, mappingRowHeight)), category)
+	actionCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(keyActionWidth, mappingRowHeight)), action)
+	selectors := container.NewBorder(nil, nil, categoryCell, nil, key)
+	return container.NewBorder(nil, nil, slotCell, actionCell, selectors)
 }
 
 func (a *App) Close() {
@@ -463,7 +542,24 @@ func (a *App) navigateForDeviceEvent(event DeviceEvent) {
 	if event.Kind == "layer" && event.Action == "on" {
 		a.focusMapping(event.Layer, a.layerTrigger(event.Layer))
 	} else if event.Kind == "key" {
-		a.focusMapping(event.Layer, event.Index)
+		a.focusMapping(a.selectedLayer, event.Index)
+	}
+	a.highlightManagedLayer(event)
+}
+
+func (a *App) highlightManagedLayer(event DeviceEvent) {
+	if a.layerManagerList == nil {
+		return
+	}
+	row, found := 0, false
+	if event.Kind == "layer" && event.Action == "on" {
+		row, found = a.layerManagerRows[event.Layer]
+	} else if event.Kind == "key" {
+		row, found = a.layerManagerTriggerRows[event.Index]
+	}
+	if found {
+		a.layerManagerList.Select(row)
+		a.layerManagerList.ScrollTo(row)
 	}
 }
 
@@ -526,26 +622,54 @@ func (a *App) showLayerManager() {
 		return nil
 	}
 	usedTriggers, usedSlots := map[int]bool{}, map[int]bool{}
-	rows := container.NewVBox()
-	var manager dialog.Dialog
 	for _, layer := range config.Layers {
-		definition := layer
 		usedTriggers[layer.Trigger], usedSlots[layer.Slot] = true, true
-		name := fmt.Sprintf("Layer %d", layer.Slot)
-		if layer.Trigger < len(inputs) {
-			name = inputs[layer.Trigger].Name + " Layer"
-		}
-		remove := widget.NewButton("Remove", func() {
-			dialog.ShowConfirm("Remove Layer", "Remove this layer and clear all of its mappings?", func(ok bool) {
-				if !ok {
-					return
-				}
-				manager.Hide()
-				a.runConfigChange("Removing layer…", 0, func() error { return a.device.RemoveLayer(definition.Slot) })
-			}, a.window)
-		})
-		remove.Importance = widget.DangerImportance
-		rows.Add(container.NewBorder(nil, nil, widget.NewLabel(name), remove))
+	}
+	layers := displayLayers(inputs, config.Layers)
+	var manager dialog.Dialog
+	layerList := widget.NewList(
+		func() int { return len(layers) },
+		func() fyne.CanvasObject {
+			name := widget.NewLabel("")
+			name.Truncation = fyne.TextTruncateEllipsis
+			remove := widget.NewButton("Remove", nil)
+			remove.Importance = widget.DangerImportance
+			action := container.New(layout.NewGridWrapLayout(fyne.NewSize(92, mappingRowHeight)), remove)
+			view := &layerManagerRowView{name: name, remove: remove}
+			view.Container = container.NewBorder(nil, nil, nil, action, name)
+			return view
+		},
+		func(id widget.ListItemID, object fyne.CanvasObject) {
+			view := object.(*layerManagerRowView)
+			layer := layers[id]
+			view.name.SetText(layer.name)
+			definition := layer.definition
+			view.remove.OnTapped = func() {
+				dialog.ShowConfirm("Remove Layer", "Remove this layer and clear all of its mappings?", func(ok bool) {
+					if !ok {
+						return
+					}
+					manager.Hide()
+					a.runConfigChange("Removing layer…", 0, func() error {
+						return a.device.RemoveLayer(definition.Slot)
+					})
+				}, a.window)
+			}
+		},
+	)
+	a.layerManagerList = layerList
+	a.layerManagerRows = make(map[int]int, len(layers))
+	a.layerManagerTriggerRows = make(map[int]int, len(layers))
+	for row, layer := range layers {
+		a.layerManagerRows[layer.definition.Slot] = row
+		a.layerManagerTriggerRows[layer.definition.Trigger] = row
+	}
+	layerListFloor := canvas.NewRectangle(color.Transparent)
+	layerListFloor.SetMinSize(fyne.NewSize(0, 120))
+	var layerRows fyne.CanvasObject = container.NewStack(layerListFloor, layerList)
+	if len(layers) == 0 {
+		layerRows = container.NewStack(layerListFloor,
+			container.NewCenter(widget.NewLabel("No layers configured")))
 	}
 
 	eligibleNames := []string{}
@@ -597,12 +721,23 @@ func (a *App) showLayerManager() {
 	content := container.NewVBox(
 		widget.NewLabel("Hold a configured switch to activate its layer. Using another control activates it immediately."),
 		container.NewBorder(nil, nil, widget.NewLabel("Hold threshold (ms)"), applyThreshold, threshold),
-		widget.NewSeparator(), rows, widget.NewSeparator(),
+		widget.NewSeparator(), layerRows, widget.NewSeparator(),
 		container.NewBorder(nil, nil, nil, add, triggerSelect),
 	)
 	manager = dialog.NewCustom("Manage Layers", "Close", content, a.window)
+	manager.SetOnClosed(func() {
+		if a.layerManagerList == layerList {
+			a.layerManagerList = nil
+			a.layerManagerRows = nil
+			a.layerManagerTriggerRows = nil
+		}
+	})
 	manager.Resize(fyne.NewSize(560, 360))
 	manager.Show()
+	if row, ok := a.layerManagerRows[a.selectedLayer]; ok {
+		layerList.Select(row)
+		layerList.ScrollTo(row)
+	}
 }
 
 func (a *App) runConfigChange(status string, targetLayer int, operation func() error) {
@@ -676,9 +811,8 @@ func (a *App) showKeyEditor(layer, index int) {
 				rebuildKeyRows()
 			})
 			remove.Importance = widget.LowImportance
-			keyRows.Add(container.NewBorder(nil, nil,
-				widget.NewLabel(fmt.Sprintf("Key %d", slot+1)), remove,
-				container.NewGridWithColumns(2, categorySelect, keySelect)))
+			keyRows.Add(keyEditorRow(
+				widget.NewLabel(fmt.Sprintf("Key %d", slot+1)), categorySelect, keySelect, remove))
 		}
 		if len(selectedKeys) >= maxMappingKeys {
 			addKey.Disable()
@@ -769,7 +903,7 @@ func (a *App) showKeyEditor(layer, index int) {
 		}
 		apply()
 	}, a.window)
-	d.Resize(fyne.NewSize(560, 500))
+	d.Resize(fyne.NewSize(620, 500))
 	d.Show()
 }
 

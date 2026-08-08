@@ -23,6 +23,25 @@ func TestMainUIFitsCompactWindow(t *testing.T) {
 	}
 }
 
+func TestResponsiveRowsKeepActionColumnSeparate(t *testing.T) {
+	testApp := fynetest.NewApp()
+	defer testApp.Quit()
+	rows := []*fyne.Container{
+		mappingRow(widget.NewLabel("0"), widget.NewLabel("A very long input name"),
+			widget.NewLabel("Ctrl+Alt+Shift+A+B+C"), widget.NewButton("Edit", nil)),
+		keyEditorRow(widget.NewLabel("Key 1"), widget.NewSelect([]string{"Navigation"}, nil),
+			widget.NewSelect([]string{"A very long key name"}, nil), widget.NewButton("Remove", nil)),
+	}
+	for index, row := range rows {
+		row.Resize(fyne.NewSize(480, mappingRowHeight))
+		content, action := row.Objects[0], row.Objects[2]
+		if content.Position().X+content.Size().Width > action.Position().X {
+			t.Fatalf("row %d content overlaps action: content=%v/%v action=%v/%v",
+				index, content.Position(), content.Size(), action.Position(), action.Size())
+		}
+	}
+}
+
 func TestCompoundKeyCapture(t *testing.T) {
 	var captured Mapping
 	capture := newKeyCaptureCanvas(func(mapping Mapping) {
@@ -82,7 +101,53 @@ func TestMappingSelectionSurvivesRebuild(t *testing.T) {
 		t.Fatal("layer release unexpectedly changed the selected tab")
 	}
 	ui.navigateForDeviceEvent(DeviceEvent{Kind: "key", Layer: 0, Index: 1})
-	if ui.selectedLayer != 0 || ui.highlightedRows[0] != 1 {
-		t.Fatal("physical input did not select Base and highlight its row")
+	if ui.selectedLayer != 1 || ui.highlightedRows[1] != 1 {
+		t.Fatal("physical input did not stay on the selected layer and highlight its row")
+	}
+}
+
+func TestDisplayLayersUsesNaturalNameOrder(t *testing.T) {
+	inputs := []InputDescriptor{
+		{Index: 0, Name: "Switch 10"},
+		{Index: 1, Name: "Switch 2"},
+		{Index: 2, Name: "Switch 1"},
+	}
+	layers := displayLayers(inputs, []LayerDefinition{
+		{Slot: 1, Trigger: 0},
+		{Slot: 3, Trigger: 1},
+		{Slot: 2, Trigger: 2},
+	})
+	want := []string{"Switch 1 Layer", "Switch 2 Layer", "Switch 10 Layer"}
+	for index, name := range want {
+		if layers[index].name != name {
+			t.Fatalf("layer %d = %q, want %q", index, layers[index].name, name)
+		}
+	}
+}
+
+func TestPhysicalInputHighlightsLayerManager(t *testing.T) {
+	testApp := fynetest.NewApp()
+	defer testApp.Quit()
+	ui := NewApp(testApp.NewWindow("Layer manager selection test"), &Device{
+		layerConfig: LayerConfig{Layers: []LayerDefinition{{Slot: 2, Trigger: 0}, {Slot: 4, Trigger: 1}}},
+	})
+	list := widget.NewList(
+		func() int { return 2 },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(widget.ListItemID, fyne.CanvasObject) {},
+	)
+	selected := -1
+	list.OnSelected = func(id widget.ListItemID) { selected = id }
+	ui.layerManagerList = list
+	ui.layerManagerRows = map[int]int{2: 1, 4: 0}
+	ui.layerManagerTriggerRows = map[int]int{0: 1, 1: 0}
+
+	ui.navigateForDeviceEvent(DeviceEvent{Kind: "key", Index: 0})
+	if selected != 1 {
+		t.Fatalf("physical trigger selected manager row %d, want 1", selected)
+	}
+	ui.navigateForDeviceEvent(DeviceEvent{Kind: "layer", Layer: 4, Action: "on"})
+	if selected != 0 {
+		t.Fatalf("layer activation selected manager row %d, want 0", selected)
 	}
 }
