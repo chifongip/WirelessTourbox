@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/driver/desktop"
 	fynetest "fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
@@ -90,9 +91,21 @@ func TestMappingSelectionSurvivesRebuild(t *testing.T) {
 	if ui.selectedLayer != 1 || ui.mappingTabs.SelectedIndex() != ui.tabByLayer[1] || ui.highlightedRows[1] != 1 {
 		t.Fatal("mapping rebuild lost selected layer or highlighted row")
 	}
-	ui.mappingLists[1].Select(0)
+	ui.focusMapping(1, 0)
 	if ui.highlightedRows[1] != 0 {
-		t.Fatal("table tap did not convert built-in selection to a non-covering row highlight")
+		t.Fatal("ordinary row container did not accept programmatic highlight")
+	}
+	row := ui.mappingRows[1][1]
+	if row.input.Text != "Encoder 1 CW" || row.mapping.Text != FormatMapping(SingleKeyMapping(MOD_LCTRL, HID_KEY_A)) {
+		t.Fatalf("mapping row content is missing: input=%q mapping=%q", row.input.Text, row.mapping.Text)
+	}
+	if !row.input.Visible() || !row.mapping.Visible() || !row.button.Visible() || row.button.OnTapped == nil {
+		t.Fatal("mapping row text or action button is unavailable")
+	}
+	row.button.Enable()
+	fynetest.Tap(row.button)
+	if ui.highlightedRows[1] != 1 {
+		t.Fatal("mapping row action button did not receive the tap")
 	}
 	ui.navigateForDeviceEvent(DeviceEvent{Kind: "layer", Layer: 1, Action: "on"})
 	if ui.selectedLayer != 1 || ui.highlightedRows[1] != 0 {
@@ -133,12 +146,17 @@ func TestPhysicalInputHighlightsLayerManager(t *testing.T) {
 	ui := NewApp(testApp.NewWindow("Layer manager selection test"), &Device{
 		layerConfig: LayerConfig{Layers: []LayerDefinition{{Slot: 2, Trigger: 0}, {Slot: 4, Trigger: 1}}},
 	})
-	list := widget.NewList(
-		func() int { return 2 },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
-		func(widget.ListItemID, fyne.CanvasObject) {},
-	)
-	ui.layerManagerList = list
+	rows := container.NewVBox()
+	for index := 0; index < 2; index++ {
+		highlight := newRowHighlight()
+		view := &layerManagerRowView{
+			Container: highlightedRow(highlight, widget.NewLabel("Layer")),
+			highlight: highlight,
+		}
+		ui.layerManagerViews = append(ui.layerManagerViews, view)
+		rows.Add(view.Container)
+	}
+	ui.layerManagerScroll = container.NewVScroll(rows)
 	ui.layerManagerRows = map[int]int{2: 1, 4: 0}
 	ui.layerManagerTriggerRows = map[int]int{0: 1, 1: 0}
 	ui.layerManagerHighlighted = -1
@@ -153,14 +171,17 @@ func TestPhysicalInputHighlightsLayerManager(t *testing.T) {
 	}
 }
 
-func TestRowHighlightNeverCoversContent(t *testing.T) {
+func TestRowHighlightUsesSeparateIndicatorCell(t *testing.T) {
 	highlight := newRowHighlight()
+	label := widget.NewLabel("Visible content")
+	row := highlightedRow(highlight, label)
+	row.Resize(fyne.NewSize(480, mappingRowHeight))
 	setRowHighlighted(highlight, true)
 	_, _, _, alpha := highlight.FillColor.RGBA()
-	if alpha != 0 {
-		t.Fatalf("highlight fill alpha = %d, want transparent", alpha)
+	if alpha == 0 {
+		t.Fatal("highlight indicator is not visible")
 	}
-	if highlight.StrokeWidth == 0 {
-		t.Fatal("highlight outline is not visible")
+	if label.Position().X < rowHighlightWidth || label.Size().Width == 0 {
+		t.Fatalf("content overlaps indicator: position=%v size=%v", label.Position(), label.Size())
 	}
 }
