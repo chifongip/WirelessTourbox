@@ -16,7 +16,7 @@ WirelessTourbox — a USB HID macro controller inspired by the TourBox, built on
 ~/.platformio/penv/bin/pio run                    # Build the project
 ~/.platformio/penv/bin/pio run -t upload          # Build and upload to the Pico W
 ~/.platformio/penv/bin/pio device monitor         # Open serial monitor
-~/.platformio/penv/bin/pio test                   # Run unit tests (native or on-device)
+~/.platformio/penv/bin/pio test -e native         # Run host-side firmware unit tests
 ~/.platformio/penv/bin/pio run -t clean           # Clean build artifacts
 ```
 
@@ -70,13 +70,14 @@ The build produces `.pio/build/pico_w/firmware.uf2`. Hold BOOTSEL on the Pico W 
 
 - `platformio.ini` — Board config (Pico W, Arduino framework, TinyUSB via `-DUSE_TINYUSB`)
 - `src/main.cpp` — Full firmware: HID keyboard + CDC serial composite, EEPROM config, input handling
+- `lib/TourboxCore/` — Host-testable debounce and HID report composition
 - `config_tool.py` — Python terminal UI for viewing and remapping key bindings
 - `test_hardware.py` — Automated hardware test script (serial commands + physical inputs)
 - `gui/` — Native GUI config tool (Go + Fyne)
   - `main.go` — Entry point, Fyne app setup
   - `device.go` — Serial communication with single-reader architecture
   - `keys.go` — HID keycode definitions and Fyne-to-HID mapping
-  - `ui.go` — GUI components, key capture dialog, monitor
+  - `ui.go` — Responsive mapping UI, key capture dialog, and fixed monitor panel
 
 The platform uses a community fork (`maxgerhardt/platform-raspberrypi`) for Pico W Arduino support.
 
@@ -85,14 +86,14 @@ The platform uses a community fork (`maxgerhardt/platform-raspberrypi`) for Pico
 - **USB Composite:** HID Keyboard + CDC Serial via Adafruit TinyUSB. `TinyUSBDevice.begin(0)` must be called before `Serial.begin()`. `#include <Adafruit_TinyUSB.h>` is required for `Serial` to link.
 - **Encoder:** EC11 rotary encoder, full quadrature state machine (CHANGE on both pins), 4 transitions per detent. Lookup table signs are specific to this encoder's resting state (3 = A=1,B=1).
 - **EEPROM:** 21 bytes — 1 magic byte (0xA5) + 10 inputs × 2 bytes (modifier + keycode).
-- **Serial Protocol:** `GET_LAYOUT` returns `mod:key,mod:key,...`. `SET_KEY:[idx]:[mod]:[key]` updates a mapping.
+- **Serial Protocol:** Existing `GET_LAYOUT` and `SET_KEY` commands remain compatible. `GET_INFO` identifies protocol version 1, and `RESET_DEFAULTS` resets mappings with one EEPROM commit.
 - **Debounce:** Switches use 5ms debounce in polling. Encoder uses full quadrature with 4-steps-per-detent counting.
-- **GUI Serial Architecture:** Single reader goroutine (`readLoop`) routes `KEY:` events to event channel and command responses to response channel. Prevents race conditions between monitor and commands.
+- **GUI Serial Architecture:** A single reader goroutine (`readLoop`) routes `KEY:` events to the monitor channel and command responses to the response channel, preventing serial read races.
 - **Key Capture (Fyne):** Three methods handle different key types:
   - `TypedRune` — printable characters (a-z, 0-9, symbols)
   - `TypedKey` — special keys (F1-F24, arrows, etc.) + Shift+key (via `desktop.Driver.CurrentKeyModifiers()`)
   - `TypedShortcut` — Ctrl/Alt+key combinations (Fyne intercepts these as shortcuts before `TypedKey`)
-  - Super key is not captured (Windows key triggers OS events first)
+  - Super/GUI can be selected explicitly even when the OS intercepts live capture
 - **Fyne Built-in Shortcuts:** Fyne maps common Ctrl+key to built-in shortcuts (Ctrl+C→Copy, Ctrl+V→Paste, etc.). The `builtinShortcuts` map in `ui.go` reverse-maps these back to HID keycodes.
 
 ## Key Constraints

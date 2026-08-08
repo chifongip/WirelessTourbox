@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -88,6 +89,22 @@ const (
 	HID_KEY_DOWN       = 0x51
 	HID_KEY_UP         = 0x52
 	HID_KEY_NUMLOCK    = 0x53
+	HID_KEY_KPSLASH    = 0x54
+	HID_KEY_KPASTERISK = 0x55
+	HID_KEY_KPMINUS    = 0x56
+	HID_KEY_KPPLUS     = 0x57
+	HID_KEY_KPENTER    = 0x58
+	HID_KEY_KP1        = 0x59
+	HID_KEY_KP2        = 0x5A
+	HID_KEY_KP3        = 0x5B
+	HID_KEY_KP4        = 0x5C
+	HID_KEY_KP5        = 0x5D
+	HID_KEY_KP6        = 0x5E
+	HID_KEY_KP7        = 0x5F
+	HID_KEY_KP8        = 0x60
+	HID_KEY_KP9        = 0x61
+	HID_KEY_KP0        = 0x62
+	HID_KEY_KPDOT      = 0x63
 	HID_KEY_F13        = 0x68
 	HID_KEY_F14        = 0x69
 	HID_KEY_F15        = 0x6A
@@ -137,21 +154,26 @@ var HIDNames = map[uint8]string{
 	0x4C: "Delete", 0x4D: "End", 0x4E: "PageDown",
 	0x4F: "Right", 0x50: "Left", 0x51: "Down", 0x52: "Up",
 	0x53: "NumLock",
+	0x54: "Keypad /", 0x55: "Keypad *", 0x56: "Keypad -",
+	0x57: "Keypad +", 0x58: "Keypad Enter", 0x59: "Keypad 1",
+	0x5A: "Keypad 2", 0x5B: "Keypad 3", 0x5C: "Keypad 4",
+	0x5D: "Keypad 5", 0x5E: "Keypad 6", 0x5F: "Keypad 7",
+	0x60: "Keypad 8", 0x61: "Keypad 9", 0x62: "Keypad 0",
+	0x63: "Keypad .",
 	0x68: "F13", 0x69: "F14", 0x6A: "F15", 0x6B: "F16",
 	0x6C: "F17", 0x6D: "F18", 0x6E: "F19", 0x6F: "F20",
 	0x70: "F21", 0x71: "F22", 0x72: "F23", 0x73: "F24",
 }
 
 // ModifierNames maps modifier bitmask values to names.
-var ModifierNames = map[uint8]string{
-	MOD_LCTRL:  "LCtrl",
-	MOD_LSHIFT: "LShift",
-	MOD_LALT:   "LAlt",
-	MOD_LGUI:   "LGui",
-	MOD_RCTRL:  "RCtrl",
-	MOD_RSHIFT: "RShift",
-	MOD_RALT:   "RAlt",
-	MOD_RGUI:   "RGui",
+var ModifierNames = []struct {
+	Bit  uint8
+	Name string
+}{
+	{MOD_LCTRL, "LCtrl"}, {MOD_LSHIFT, "LShift"},
+	{MOD_LALT, "LAlt"}, {MOD_LGUI, "LGui"},
+	{MOD_RCTRL, "RCtrl"}, {MOD_RSHIFT, "RShift"},
+	{MOD_RALT, "RAlt"}, {MOD_RGUI, "RGui"},
 }
 
 // FyneToHID maps Fyne key names to HID keycodes.
@@ -168,28 +190,28 @@ var FyneToHID = map[fyne.KeyName]uint8{
 	fyne.Key0: HID_KEY_0, fyne.Key1: HID_KEY_1, fyne.Key2: HID_KEY_2,
 	fyne.Key3: HID_KEY_3, fyne.Key4: HID_KEY_4, fyne.Key5: HID_KEY_5,
 	fyne.Key6: HID_KEY_6, fyne.Key7: HID_KEY_7, fyne.Key8: HID_KEY_8,
-	fyne.Key9: HID_KEY_9,
-	fyne.KeyF1:  HID_KEY_F1, fyne.KeyF2:  HID_KEY_F2,
-	fyne.KeyF3:  HID_KEY_F3, fyne.KeyF4:  HID_KEY_F4,
-	fyne.KeyF5:  HID_KEY_F5, fyne.KeyF6:  HID_KEY_F6,
-	fyne.KeyF7:  HID_KEY_F7, fyne.KeyF8:  HID_KEY_F8,
-	fyne.KeyF9:  HID_KEY_F9, fyne.KeyF10: HID_KEY_F10,
+	fyne.Key9:  HID_KEY_9,
+	fyne.KeyF1: HID_KEY_F1, fyne.KeyF2: HID_KEY_F2,
+	fyne.KeyF3: HID_KEY_F3, fyne.KeyF4: HID_KEY_F4,
+	fyne.KeyF5: HID_KEY_F5, fyne.KeyF6: HID_KEY_F6,
+	fyne.KeyF7: HID_KEY_F7, fyne.KeyF8: HID_KEY_F8,
+	fyne.KeyF9: HID_KEY_F9, fyne.KeyF10: HID_KEY_F10,
 	fyne.KeyF11: HID_KEY_F11, fyne.KeyF12: HID_KEY_F12,
-	fyne.KeyUp:       HID_KEY_UP,
-	fyne.KeyDown:     HID_KEY_DOWN,
-	fyne.KeyLeft:     HID_KEY_LEFT,
-	fyne.KeyRight:    HID_KEY_RIGHT,
-	fyne.KeyReturn:   HID_KEY_ENTER,
-	fyne.KeyEscape:   HID_KEY_ESCAPE,
+	fyne.KeyUp:        HID_KEY_UP,
+	fyne.KeyDown:      HID_KEY_DOWN,
+	fyne.KeyLeft:      HID_KEY_LEFT,
+	fyne.KeyRight:     HID_KEY_RIGHT,
+	fyne.KeyReturn:    HID_KEY_ENTER,
+	fyne.KeyEscape:    HID_KEY_ESCAPE,
 	fyne.KeyBackspace: HID_KEY_BACKSPACE,
-	fyne.KeyTab:      HID_KEY_TAB,
-	fyne.KeySpace:    HID_KEY_SPACE,
-	fyne.KeyDelete:   HID_KEY_DELETE,
-	fyne.KeyHome:     HID_KEY_HOME,
-	fyne.KeyEnd:      HID_KEY_END,
-	fyne.KeyPageUp:   HID_KEY_PAGEUP,
-	fyne.KeyPageDown: HID_KEY_PAGEDOWN,
-	fyne.KeyInsert:   HID_KEY_INSERT,
+	fyne.KeyTab:       HID_KEY_TAB,
+	fyne.KeySpace:     HID_KEY_SPACE,
+	fyne.KeyDelete:    HID_KEY_DELETE,
+	fyne.KeyHome:      HID_KEY_HOME,
+	fyne.KeyEnd:       HID_KEY_END,
+	fyne.KeyPageUp:    HID_KEY_PAGEUP,
+	fyne.KeyPageDown:  HID_KEY_PAGEDOWN,
+	fyne.KeyInsert:    HID_KEY_INSERT,
 	// Symbol keys
 	fyne.KeyComma:        HID_KEY_COMMA,
 	fyne.KeyPeriod:       HID_KEY_DOT,
@@ -227,6 +249,15 @@ var RuneToHID = map[rune]uint8{
 	' ': HID_KEY_SPACE,
 }
 
+var ShiftedRuneToHID = map[rune]uint8{
+	'!': HID_KEY_1, '@': HID_KEY_2, '#': HID_KEY_3, '$': HID_KEY_4,
+	'%': HID_KEY_5, '^': HID_KEY_6, '&': HID_KEY_7, '*': HID_KEY_8,
+	'(': HID_KEY_9, ')': HID_KEY_0, '_': HID_KEY_MINUS, '+': HID_KEY_EQUAL,
+	'{': HID_KEY_LEFTBRACE, '}': HID_KEY_RIGHTBRACE, '|': HID_KEY_BACKSLASH,
+	':': HID_KEY_SEMICOLON, '"': HID_KEY_APOSTROPHE, '~': HID_KEY_GRAVE,
+	'<': HID_KEY_COMMA, '>': HID_KEY_DOT, '?': HID_KEY_SLASH,
+}
+
 // FormatKey returns a human-readable string for a modifier+keycode combination.
 func FormatKey(mod, keycode uint8) string {
 	name, ok := HIDNames[keycode]
@@ -245,12 +276,62 @@ func ModifierString(mod uint8) string {
 		return "None"
 	}
 	parts := []string{}
-	for bit, name := range ModifierNames {
-		if mod&bit != 0 {
-			parts = append(parts, name)
+	for _, modifier := range ModifierNames {
+		if mod&modifier.Bit != 0 {
+			parts = append(parts, modifier.Name)
 		}
 	}
 	return strings.Join(parts, "+")
+}
+
+var KeyCategories = []string{"Letters", "Numbers", "Symbols", "Editing", "Navigation", "Function", "Keypad"}
+
+// KeyChoices returns stable, keycode-ordered names for a picker category.
+func KeyChoices(category string) []string {
+	type choice struct {
+		code uint8
+		name string
+	}
+	choices := []choice{}
+	for code, name := range HIDNames {
+		if KeyCategory(code) == category {
+			choices = append(choices, choice{code: code, name: name})
+		}
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].code < choices[j].code })
+	names := make([]string, len(choices))
+	for i, choice := range choices {
+		names[i] = choice.name
+	}
+	return names
+}
+
+func KeyCategory(code uint8) string {
+	switch {
+	case code >= HID_KEY_A && code <= HID_KEY_Z:
+		return "Letters"
+	case code >= HID_KEY_1 && code <= HID_KEY_0:
+		return "Numbers"
+	case code >= HID_KEY_MINUS && code <= HID_KEY_SLASH:
+		return "Symbols"
+	case code >= HID_KEY_F1 && code <= HID_KEY_F12, code >= HID_KEY_F13 && code <= HID_KEY_F24:
+		return "Function"
+	case code >= HID_KEY_KPSLASH && code <= HID_KEY_KPDOT:
+		return "Keypad"
+	case code >= HID_KEY_INSERT && code <= HID_KEY_NUMLOCK:
+		return "Navigation"
+	default:
+		return "Editing"
+	}
+}
+
+func KeyCodeByName(name string) (uint8, bool) {
+	for code, candidate := range HIDNames {
+		if candidate == name {
+			return code, true
+		}
+	}
+	return 0, false
 }
 
 // HIDKeyName returns the name for a HID keycode, or hex string if unknown.
