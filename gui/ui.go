@@ -39,6 +39,7 @@ type App struct {
 	layerManagerList        *widget.List
 	layerManagerRows        map[int]int
 	layerManagerTriggerRows map[int]int
+	layerManagerHighlighted int
 	monitorLog              *widget.List
 	monEntries              []string
 	busy                    bool
@@ -67,7 +68,7 @@ func NewApp(window fyne.Window, device *Device) *App {
 	return &App{
 		window: window, device: device, stopRefresh: make(chan struct{}),
 		tabByLayer: make(map[int]int), mappingLists: make(map[int]*widget.List),
-		highlightedRows: make(map[int]int),
+		highlightedRows: make(map[int]int), layerManagerHighlighted: -1,
 	}
 }
 
@@ -219,18 +220,14 @@ func (a *App) rebuildMappings(targetLayer ...int) {
 		a.selectedLayer = 0
 		appTabs.SelectIndex(0)
 	}
-	for layer, input := range a.highlightedRows {
-		if list := a.mappingLists[layer]; list != nil && input >= 0 && input < len(inputs) {
-			list.Select(input)
-		}
-	}
 	if a.connectBtn != nil && a.resetBtn != nil && a.manageBtn != nil {
 		a.updateControls()
 	}
 }
 
 func (a *App) mappingTable(layer, trigger int, inputs []InputDescriptor, mappings []Mapping) fyne.CanvasObject {
-	list := widget.NewList(
+	var list *widget.List
+	list = widget.NewList(
 		func() int { return len(inputs) },
 		func() fyne.CanvasObject {
 			indexLabel := widget.NewLabel("")
@@ -241,9 +238,11 @@ func (a *App) mappingTable(layer, trigger int, inputs []InputDescriptor, mapping
 			mappingLabel.TextStyle = fyne.TextStyle{Monospace: true}
 			mappingLabel.Truncation = fyne.TextTruncateEllipsis
 			button := widget.NewButton("Edit", nil)
+			highlight := newRowHighlight()
 			view := &mappingRowView{index: indexLabel, input: inputLabel,
-				mapping: mappingLabel, button: button}
-			view.Container = mappingRow(indexLabel, inputLabel, mappingLabel, button)
+				mapping: mappingLabel, button: button, highlight: highlight}
+			view.Container = container.NewStack(highlight,
+				mappingRow(indexLabel, inputLabel, mappingLabel, button))
 			return view
 		},
 		func(id widget.ListItemID, object fyne.CanvasObject) {
@@ -270,8 +269,14 @@ func (a *App) mappingTable(layer, trigger int, inputs []InputDescriptor, mapping
 			} else {
 				view.button.Disable()
 			}
+			highlighted, ok := a.highlightedRows[layer]
+			setRowHighlighted(view.highlight, ok && highlighted == id)
 		},
 	)
+	list.OnSelected = func(id widget.ListItemID) {
+		list.Unselect(id)
+		a.focusMapping(layer, id)
+	}
 	a.mappingLists[layer] = list
 	header := mappingRow(
 		widget.NewLabelWithStyle("#", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
@@ -286,16 +291,18 @@ func (a *App) mappingTable(layer, trigger int, inputs []InputDescriptor, mapping
 
 type mappingRowView struct {
 	*fyne.Container
-	index   *widget.Label
-	input   *widget.Label
-	mapping *widget.Label
-	button  *widget.Button
+	index     *widget.Label
+	input     *widget.Label
+	mapping   *widget.Label
+	button    *widget.Button
+	highlight *canvas.Rectangle
 }
 
 type layerManagerRowView struct {
 	*fyne.Container
-	name   *widget.Label
-	remove *widget.Button
+	name      *widget.Label
+	remove    *widget.Button
+	highlight *canvas.Rectangle
 }
 
 func (a *App) focusMapping(layer, input int) {
@@ -306,10 +313,30 @@ func (a *App) focusMapping(layer, input int) {
 	a.selectedLayer = layer
 	a.mappingTabs.SelectIndex(tab)
 	if list := a.mappingLists[layer]; list != nil {
+		previous, hadPrevious := a.highlightedRows[layer]
 		a.highlightedRows[layer] = input
-		list.Select(input)
+		if hadPrevious && previous != input {
+			list.RefreshItem(previous)
+		}
+		list.RefreshItem(input)
 		list.ScrollTo(input)
 	}
+}
+
+func newRowHighlight() *canvas.Rectangle {
+	highlight := canvas.NewRectangle(color.Transparent)
+	highlight.StrokeColor = theme.Color(theme.ColorNamePrimary)
+	highlight.CornerRadius = 4
+	return highlight
+}
+
+func setRowHighlighted(highlight *canvas.Rectangle, selected bool) {
+	if selected {
+		highlight.StrokeWidth = 2
+	} else {
+		highlight.StrokeWidth = 0
+	}
+	highlight.Refresh()
 }
 
 func mappingRow(index, input, mapping, action fyne.CanvasObject) *fyne.Container {
@@ -558,9 +585,21 @@ func (a *App) highlightManagedLayer(event DeviceEvent) {
 		row, found = a.layerManagerTriggerRows[event.Index]
 	}
 	if found {
-		a.layerManagerList.Select(row)
-		a.layerManagerList.ScrollTo(row)
+		a.setLayerManagerHighlight(row)
 	}
+}
+
+func (a *App) setLayerManagerHighlight(row int) {
+	if a.layerManagerList == nil {
+		return
+	}
+	previous := a.layerManagerHighlighted
+	a.layerManagerHighlighted = row
+	if previous >= 0 && previous != row {
+		a.layerManagerList.RefreshItem(previous)
+	}
+	a.layerManagerList.RefreshItem(row)
+	a.layerManagerList.ScrollTo(row)
 }
 
 func (a *App) monitorSession(port string, events <-chan DeviceEvent, errors <-chan error) {
@@ -627,7 +666,8 @@ func (a *App) showLayerManager() {
 	}
 	layers := displayLayers(inputs, config.Layers)
 	var manager dialog.Dialog
-	layerList := widget.NewList(
+	var layerList *widget.List
+	layerList = widget.NewList(
 		func() int { return len(layers) },
 		func() fyne.CanvasObject {
 			name := widget.NewLabel("")
@@ -635,8 +675,10 @@ func (a *App) showLayerManager() {
 			remove := widget.NewButton("Remove", nil)
 			remove.Importance = widget.DangerImportance
 			action := container.New(layout.NewGridWrapLayout(fyne.NewSize(92, mappingRowHeight)), remove)
-			view := &layerManagerRowView{name: name, remove: remove}
-			view.Container = container.NewBorder(nil, nil, nil, action, name)
+			highlight := newRowHighlight()
+			view := &layerManagerRowView{name: name, remove: remove, highlight: highlight}
+			view.Container = container.NewStack(highlight,
+				container.NewBorder(nil, nil, nil, action, name))
 			return view
 		},
 		func(id widget.ListItemID, object fyne.CanvasObject) {
@@ -655,9 +697,15 @@ func (a *App) showLayerManager() {
 					})
 				}, a.window)
 			}
+			setRowHighlighted(view.highlight, a.layerManagerHighlighted == id)
 		},
 	)
+	layerList.OnSelected = func(id widget.ListItemID) {
+		layerList.Unselect(id)
+		a.setLayerManagerHighlight(id)
+	}
 	a.layerManagerList = layerList
+	a.layerManagerHighlighted = -1
 	a.layerManagerRows = make(map[int]int, len(layers))
 	a.layerManagerTriggerRows = make(map[int]int, len(layers))
 	for row, layer := range layers {
@@ -730,13 +778,13 @@ func (a *App) showLayerManager() {
 			a.layerManagerList = nil
 			a.layerManagerRows = nil
 			a.layerManagerTriggerRows = nil
+			a.layerManagerHighlighted = -1
 		}
 	})
 	manager.Resize(fyne.NewSize(560, 360))
 	manager.Show()
 	if row, ok := a.layerManagerRows[a.selectedLayer]; ok {
-		layerList.Select(row)
-		layerList.ScrollTo(row)
+		a.setLayerManagerHighlight(row)
 	}
 }
 

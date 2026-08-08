@@ -82,15 +82,17 @@ func TestMappingSelectionSurvivesRebuild(t *testing.T) {
 	ui.BuildUI()
 	defer ui.Close()
 
-	selected := -1
-	ui.mappingLists[1].OnSelected = func(id widget.ListItemID) { selected = id }
 	ui.focusMapping(1, 1)
-	if ui.selectedLayer != 1 || selected != 1 {
-		t.Fatalf("focus = layer %d, row %d", ui.selectedLayer, selected)
+	if ui.selectedLayer != 1 || ui.highlightedRows[1] != 1 {
+		t.Fatalf("focus = layer %d, row %d", ui.selectedLayer, ui.highlightedRows[1])
 	}
 	ui.rebuildMappings()
 	if ui.selectedLayer != 1 || ui.mappingTabs.SelectedIndex() != ui.tabByLayer[1] || ui.highlightedRows[1] != 1 {
 		t.Fatal("mapping rebuild lost selected layer or highlighted row")
+	}
+	ui.mappingLists[1].Select(0)
+	if ui.highlightedRows[1] != 0 {
+		t.Fatal("table tap did not convert built-in selection to a non-covering row highlight")
 	}
 	ui.navigateForDeviceEvent(DeviceEvent{Kind: "layer", Layer: 1, Action: "on"})
 	if ui.selectedLayer != 1 || ui.highlightedRows[1] != 0 {
@@ -136,18 +138,29 @@ func TestPhysicalInputHighlightsLayerManager(t *testing.T) {
 		func() fyne.CanvasObject { return widget.NewLabel("") },
 		func(widget.ListItemID, fyne.CanvasObject) {},
 	)
-	selected := -1
-	list.OnSelected = func(id widget.ListItemID) { selected = id }
 	ui.layerManagerList = list
 	ui.layerManagerRows = map[int]int{2: 1, 4: 0}
 	ui.layerManagerTriggerRows = map[int]int{0: 1, 1: 0}
+	ui.layerManagerHighlighted = -1
 
 	ui.navigateForDeviceEvent(DeviceEvent{Kind: "key", Index: 0})
-	if selected != 1 {
-		t.Fatalf("physical trigger selected manager row %d, want 1", selected)
+	if ui.layerManagerHighlighted != 1 {
+		t.Fatalf("physical trigger highlighted manager row %d, want 1", ui.layerManagerHighlighted)
 	}
 	ui.navigateForDeviceEvent(DeviceEvent{Kind: "layer", Layer: 4, Action: "on"})
-	if selected != 0 {
-		t.Fatalf("layer activation selected manager row %d, want 0", selected)
+	if ui.layerManagerHighlighted != 0 {
+		t.Fatalf("layer activation highlighted manager row %d, want 0", ui.layerManagerHighlighted)
+	}
+}
+
+func TestRowHighlightNeverCoversContent(t *testing.T) {
+	highlight := newRowHighlight()
+	setRowHighlighted(highlight, true)
+	_, _, _, alpha := highlight.FillColor.RGBA()
+	if alpha != 0 {
+		t.Fatalf("highlight fill alpha = %d, want transparent", alpha)
+	}
+	if highlight.StrokeWidth == 0 {
+		t.Fatal("highlight outline is not visible")
 	}
 }
