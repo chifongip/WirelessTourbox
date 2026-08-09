@@ -38,6 +38,7 @@ type App struct {
 	highlightedRows         map[int]int
 	selectedLayer           int
 	layerManagerScroll      *container.Scroll
+	layerManagerHost        *fyne.Container
 	layerManagerViews       []*layerManagerRowView
 	layerManagerRows        map[int]int
 	layerManagerTriggerRows map[int]int
@@ -672,6 +673,32 @@ func (a *App) showLayerManager() {
 	if !a.device.IsConnected() || a.device.ProtocolVersion() < 2 {
 		return
 	}
+	host := container.NewStack()
+	manager := dialog.NewCustom("Manage Layers", "Close", host, a.window)
+	a.layerManagerHost = host
+	a.populateLayerManager(manager, host)
+	manager.SetOnClosed(func() {
+		if a.layerManagerHost == host {
+			a.clearLayerManagerState()
+		}
+	})
+	manager.Resize(fyne.NewSize(560, 360))
+	manager.Show()
+}
+
+func (a *App) clearLayerManagerState() {
+	a.layerManagerHost = nil
+	a.layerManagerScroll = nil
+	a.layerManagerViews = nil
+	a.layerManagerRows = nil
+	a.layerManagerTriggerRows = nil
+	a.layerManagerHighlighted = -1
+}
+
+func (a *App) populateLayerManager(manager dialog.Dialog, host *fyne.Container) {
+	if !a.device.IsConnected() || a.device.ProtocolVersion() < 2 || a.layerManagerHost != host {
+		return
+	}
 	caps, inputs, config, _ := a.device.Snapshot()
 	threshold := widget.NewEntry()
 	threshold.SetText(strconv.Itoa(config.HoldMS))
@@ -687,7 +714,6 @@ func (a *App) showLayerManager() {
 		usedTriggers[layer.Trigger], usedSlots[layer.Slot] = true, true
 	}
 	layers := displayLayers(inputs, config.Layers)
-	var manager dialog.Dialog
 	layerRowsBox := container.NewVBox()
 	views := make([]*layerManagerRowView, 0, len(layers))
 	a.layerManagerHighlighted = -1
@@ -706,8 +732,7 @@ func (a *App) showLayerManager() {
 				if targetLayer == definition.Slot {
 					targetLayer = 0
 				}
-				manager.Hide()
-				a.runLayerManagerChange("Removing layer…", targetLayer, func() error {
+				a.runLayerManagerChange(manager, host, "Removing layer…", targetLayer, func() error {
 					return a.device.RemoveLayer(definition.Slot)
 				})
 			}, a.window)
@@ -766,8 +791,9 @@ func (a *App) showLayerManager() {
 			dialog.ShowError(fmt.Errorf("maximum layer count reached"), a.window)
 			return
 		}
-		manager.Hide()
-		a.runLayerManagerChange("Adding layer…", slot, func() error { return a.device.SetLayer(slot, trigger) })
+		a.runLayerManagerChange(manager, host, "Adding layer…", slot, func() error {
+			return a.device.SetLayer(slot, trigger)
+		})
 	})
 	if len(eligibleNames) == 0 || len(config.Layers) >= caps.MaxLayers {
 		triggerSelect.Disable()
@@ -779,8 +805,9 @@ func (a *App) showLayerManager() {
 			dialog.ShowError(fmt.Errorf("hold threshold must be %d–%d ms", minimumHoldMS, maximumHoldMS), a.window)
 			return
 		}
-		manager.Hide()
-		a.runConfigChange("Updating hold threshold…", a.selectedLayer, func() error { return a.device.SetHoldMS(value) })
+		a.runLayerManagerChange(manager, host, "Updating hold threshold…", a.selectedLayer, func() error {
+			return a.device.SetHoldMS(value)
+		})
 	})
 	content := container.NewVBox(
 		widget.NewLabel("Hold a configured switch to activate its layer. Using another control activates it immediately."),
@@ -788,18 +815,8 @@ func (a *App) showLayerManager() {
 		widget.NewSeparator(), layerRows, widget.NewSeparator(),
 		container.NewBorder(nil, nil, nil, add, triggerSelect),
 	)
-	manager = dialog.NewCustom("Manage Layers", "Close", content, a.window)
-	manager.SetOnClosed(func() {
-		if a.layerManagerScroll == layerScroll {
-			a.layerManagerScroll = nil
-			a.layerManagerViews = nil
-			a.layerManagerRows = nil
-			a.layerManagerTriggerRows = nil
-			a.layerManagerHighlighted = -1
-		}
-	})
-	manager.Resize(fyne.NewSize(560, 360))
-	manager.Show()
+	host.Objects = []fyne.CanvasObject{content}
+	host.Refresh()
 	if row, ok := a.layerManagerRows[a.selectedLayer]; ok {
 		a.setLayerManagerHighlight(row)
 	}
@@ -809,12 +826,37 @@ func (a *App) runConfigChange(status string, targetLayer int, operation func() e
 	a.runConfigChangeWithCompletion(status, targetLayer, operation, nil)
 }
 
-func (a *App) runLayerManagerChange(status string, targetLayer int, operation func() error) {
+func (a *App) runLayerManagerChange(manager dialog.Dialog, host *fyne.Container, status string,
+	targetLayer int, operation func() error) <-chan struct{} {
+	completed := make(chan struct{})
+	if a.layerManagerHost != host {
+		close(completed)
+		return completed
+	}
+	a.layerManagerScroll = nil
+	a.layerManagerViews = nil
+	a.layerManagerRows = nil
+	a.layerManagerTriggerRows = nil
+	a.layerManagerHighlighted = -1
+	progress := widget.NewProgressBarInfinite()
+	progressCell := container.New(layout.NewGridWrapLayout(fyne.NewSize(280, 24)), progress)
+	host.Objects = []fyne.CanvasObject{container.NewCenter(container.NewVBox(
+		widget.NewLabel(status), progressCell,
+	))}
+	host.Refresh()
 	a.runConfigChangeWithCompletion(status, targetLayer, operation, func() {
+		defer close(completed)
+		if a.layerManagerHost != host {
+			return
+		}
 		if a.device.IsConnected() && a.device.ProtocolVersion() >= 2 {
-			a.showLayerManager()
+			a.populateLayerManager(manager, host)
+		} else {
+			host.Objects = []fyne.CanvasObject{container.NewCenter(widget.NewLabel("Device disconnected"))}
+			host.Refresh()
 		}
 	})
+	return completed
 }
 
 func (a *App) runConfigChangeWithCompletion(status string, targetLayer int, operation func() error, completed func()) {

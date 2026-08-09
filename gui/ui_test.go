@@ -6,6 +6,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
 	fynetest "fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
@@ -205,5 +206,59 @@ func TestConfigChangeCompletionRunsAfterRebuild(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("config change completion was not called")
+	}
+}
+
+func TestLayerManagerChangeRefreshesSameDialogHost(t *testing.T) {
+	testApp := fynetest.NewApp()
+	defer testApp.Quit()
+	window := testApp.NewWindow("Persistent layer manager test")
+	device := &Device{
+		session:         &deviceSession{},
+		protocolVersion: 3,
+		capabilities:    DeviceCapabilities{Protocol: 3, InputCount: 2, MaxLayers: 15, MaxKeys: 3},
+		inputs: []InputDescriptor{
+			{Index: 0, Kind: "S", LayerEligible: true, Name: "Switch 1"},
+			{Index: 1, Kind: "S", LayerEligible: true, Name: "Switch 2"},
+		},
+		layerConfig: LayerConfig{HoldMS: 200},
+		layouts:     map[int][]Mapping{0: make([]Mapping, 2)},
+	}
+	ui := NewApp(window, device)
+	ui.BuildUI()
+	defer func() {
+		device.mu.Lock()
+		device.session = nil
+		device.mu.Unlock()
+		ui.Close()
+	}()
+
+	host := container.NewStack()
+	manager := dialog.NewCustom("Manage Layers", "Close", host, window)
+	ui.layerManagerHost = host
+	ui.populateLayerManager(manager, host)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := ui.runLayerManagerChange(manager, host, "Adding layer…", 1, func() error {
+		close(started)
+		<-release
+		device.mu.Lock()
+		device.layerConfig.Layers = []LayerDefinition{{Slot: 1, Trigger: 0}}
+		device.layouts[1] = make([]Mapping, 2)
+		device.mu.Unlock()
+		return nil
+	})
+	<-started
+	if ui.layerManagerHost != host {
+		t.Fatal("layer manager replaced its dialog host during the operation")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("layer manager refresh did not complete")
+	}
+	if ui.layerManagerHost != host || ui.layerManagerScroll == nil || len(ui.layerManagerViews) != 1 {
+		t.Fatal("layer manager did not refresh its existing dialog content")
 	}
 }
