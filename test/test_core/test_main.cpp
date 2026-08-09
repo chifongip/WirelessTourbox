@@ -103,6 +103,45 @@ void test_other_input_promotes_pending_and_first_trigger_wins() {
     TEST_ASSERT_FALSE(state.promoteForActivity(3));
 }
 
+void test_clear_layer_reports_and_resets_active_layer() {
+    tourbox::LayerState state;
+    TEST_ASSERT_TRUE(state.beginTrigger(1, 3, 100));
+    TEST_ASSERT_TRUE(state.update(300, 200));
+    TEST_ASSERT_TRUE(state.clearLayer(3));
+    TEST_ASSERT_EQUAL_UINT8(0, state.currentLayer());
+    TEST_ASSERT_EQUAL_INT8(-1, state.activeTrigger());
+}
+
+void test_clear_layer_silently_resets_pending_layer() {
+    tourbox::LayerState state;
+    TEST_ASSERT_TRUE(state.beginTrigger(2, 4, 100));
+    TEST_ASSERT_FALSE(state.clearLayer(4));
+    TEST_ASSERT_FALSE(state.hasPending());
+    TEST_ASSERT_EQUAL_UINT8(0, state.pendingLayer());
+}
+
+void test_clear_layer_ignores_other_layer() {
+    tourbox::LayerState state;
+    TEST_ASSERT_TRUE(state.beginTrigger(1, 3, 100));
+    TEST_ASSERT_TRUE(state.update(300, 200));
+    TEST_ASSERT_FALSE(state.clearLayer(2));
+    TEST_ASSERT_EQUAL_UINT8(3, state.currentLayer());
+    TEST_ASSERT_EQUAL_INT8(1, state.activeTrigger());
+}
+
+void test_config_value_updates_only_when_changed() {
+    uint8_t trigger = 2;
+    TEST_ASSERT_FALSE(tourbox::updateConfigValue(trigger, uint8_t{2}));
+    TEST_ASSERT_EQUAL_UINT8(2, trigger);
+    TEST_ASSERT_TRUE(tourbox::updateConfigValue(trigger, uint8_t{3}));
+    TEST_ASSERT_EQUAL_UINT8(3, trigger);
+
+    uint16_t holdMs = 200;
+    TEST_ASSERT_FALSE(tourbox::updateConfigValue(holdMs, uint16_t{200}));
+    TEST_ASSERT_TRUE(tourbox::updateConfigValue(holdMs, uint16_t{350}));
+    TEST_ASSERT_EQUAL_UINT16(350, holdMs);
+}
+
 void test_crc_detects_changes() {
     uint8_t data[] = {1, 2, 3, 4, 5};
     uint16_t original = tourbox::crc16(data, sizeof(data));
@@ -134,6 +173,10 @@ int main(int, char**) {
     RUN_TEST(test_layer_quick_release_is_tap);
     RUN_TEST(test_layer_activates_after_hold_and_deactivates_on_release);
     RUN_TEST(test_other_input_promotes_pending_and_first_trigger_wins);
+    RUN_TEST(test_clear_layer_reports_and_resets_active_layer);
+    RUN_TEST(test_clear_layer_silently_resets_pending_layer);
+    RUN_TEST(test_clear_layer_ignores_other_layer);
+    RUN_TEST(test_config_value_updates_only_when_changed);
     RUN_TEST(test_crc_detects_changes);
     RUN_TEST(test_v2_mappings_expand_without_data_loss);
     return UNITY_END();

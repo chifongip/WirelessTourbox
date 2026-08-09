@@ -11,6 +11,13 @@ constexpr uint8_t MODE_COUNT = MAX_LAYERS + 1;
 constexpr uint8_t NO_TRIGGER = 0xFF;
 constexpr uint8_t MAX_MAPPING_KEYS = 3;
 
+template <typename T>
+inline bool updateConfigValue(T& current, const T& next) {
+    if (current == next) return false;
+    current = next;
+    return true;
+}
+
 struct Mapping {
     uint8_t modifier;
     uint8_t keys[MAX_MAPPING_KEYS];
@@ -151,6 +158,12 @@ public:
     int8_t pendingInput() const { return pendingInput_; }
     int8_t activeTrigger() const { return activeTrigger_; }
     bool hasPending() const { return pendingInput_ >= 0; }
+
+    bool clearLayer(uint8_t layer) {
+        bool wasActive = activeLayer_ == layer;
+        if (wasActive || pendingLayer_ == layer) reset();
+        return wasActive;
+    }
 
     void reset() {
         pendingInput_ = -1;

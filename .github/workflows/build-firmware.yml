@@ -7,6 +7,10 @@ on:
       - 'src/**'
       - 'lib/**'
       - 'test/**'
+      - 'config_tool.py'
+      - 'serial_protocol.py'
+      - 'test_hardware.py'
+      - 'test_serial_protocol.py'
       - 'platformio.ini'
   pull_request:
     branches: [main]
@@ -14,6 +18,10 @@ on:
       - 'src/**'
       - 'lib/**'
       - 'test/**'
+      - 'config_tool.py'
+      - 'serial_protocol.py'
+      - 'test_hardware.py'
+      - 'test_serial_protocol.py'
       - 'platformio.ini'
   workflow_dispatch:
 
@@ -27,6 +35,10 @@ jobs:
           python-version: '3.12'
       - name: Install PlatformIO
         run: pip install platformio
+      - name: Test Python serial tools
+        run: |
+          python -m unittest -v test_serial_protocol.py
+          python -m py_compile serial_protocol.py config_tool.py test_hardware.py
       - name: Run host tests
         run: pio test -e native
       - name: Build Pico W firmware

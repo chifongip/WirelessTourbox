@@ -71,6 +71,7 @@ The build produces `.pio/build/pico_w/firmware.uf2`. Hold BOOTSEL on the Pico W 
 - `platformio.ini` — Board config (Pico W, Arduino framework, TinyUSB via `-DUSE_TINYUSB`)
 - `src/main.cpp` — Full firmware: HID keyboard + CDC serial composite, EEPROM config, input handling
 - `lib/TourboxCore/` — Host-testable debounce and HID report composition
+- `serial_protocol.py` — Shared command/response matching for Python serial tools
 - `config_tool.py` — Python terminal UI for viewing and remapping key bindings
 - `test_hardware.py` — Automated hardware test script (serial commands + physical inputs)
 - `gui/` — Native GUI config tool (Go + Fyne)
@@ -85,8 +86,8 @@ The platform uses a community fork (`maxgerhardt/platform-raspberrypi`) for Pico
 
 - **USB Composite:** HID Keyboard + CDC Serial via Adafruit TinyUSB. `TinyUSBDevice.begin(0)` must be called before `Serial.begin()`. `#include <Adafruit_TinyUSB.h>` is required for `Serial` to link.
 - **Encoder:** EC11 rotary encoder, full quadrature state machine (CHANGE on both pins), 4 transitions per detent. Lookup table signs are specific to this encoder's resting state (3 = A=1,B=1).
-- **EEPROM:** 21 bytes — 1 magic byte (0xA5) + 10 inputs × 2 bytes (modifier + keycode).
-- **Serial Protocol:** Existing `GET_LAYOUT` and `SET_KEY` commands remain compatible. `GET_INFO` identifies protocol version 1, and `RESET_DEFAULTS` resets mappings with one EEPROM commit.
+- **EEPROM:** Schema 3 uses 2071 bytes: a 21-byte header (magic `0x5742`, schema, input count, hold threshold, and 15 layer triggers), 16 layers × 32 inputs × 4-byte mappings, and a 2-byte CRC. Legacy schema 1 and schema 2 data migrate during startup.
+- **Serial Protocol:** `GET_INFO` identifies protocol version 3. The current protocol supports capability/input discovery, compound mappings of up to three keys, and switch-held layers while retaining compatible `GET_LAYOUT` and `SET_KEY` commands. `KEY:` and `LAYER:` lines are asynchronous events, not command responses.
 - **Debounce:** Switches use 5ms debounce in polling. Encoder uses full quadrature with 4-steps-per-detent counting.
 - **GUI Serial Architecture:** A single reader goroutine (`readLoop`) routes `KEY:` events to the monitor channel and command responses to the response channel, preventing serial read races.
 - **Key Capture (Fyne):** Three methods handle different key types:
@@ -102,5 +103,7 @@ The platform uses a community fork (`maxgerhardt/platform-raspberrypi`) for Pico
 - TinyUSB is enabled (`-DUSE_TINYUSB`) — use TinyUSB APIs, not the default Pico SDK USB stack
 - The Pico W has onboard WiFi (CYW43) — available via the `WiFi` library
 - HID keycodes F13-F22 are sent via `keyboardReport()` (not `keyboardPress()`, which only supports ASCII)
+- Mappings contain one modifier byte plus up to three simultaneous HID keycodes; active switch mappings are latched until release
+- Layer triggers use a 100–1000 ms hold threshold and can remap switches, clicks, and encoder directions
 - Windows GUI build requires `-ldflags "-H windowsgui"` to hide terminal window
 - macOS cross-compilation requires osxcross with macOS SDK

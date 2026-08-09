@@ -10,6 +10,8 @@ import serial
 import sys
 import time
 
+from serial_protocol import send_command
+
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
 BAUD = 115200
 TIMEOUT = 30
@@ -34,41 +36,36 @@ HID_KEYS = {
 }
 
 
+def report_async_event(line):
+    """Display physical events observed while waiting for a command response."""
+    print(f"  [event] {line}")
+
+
 def test_serial_commands(ser):
     """Test GET_LAYOUT and SET_KEY commands."""
     print("\n--- Serial Command Tests ---")
     results = []
 
     # Test GET_LAYOUT
-    ser.write(b"GET_LAYOUT\n")
-    time.sleep(0.2)
-    resp = ser.readline().decode("utf-8", errors="replace").strip()
+    resp = send_command(ser, "GET_LAYOUT", on_event=report_async_event)
     ok = resp.startswith("0:104") or resp.startswith("0:0:")
     results.append(("GET_LAYOUT returns config", ok, resp))
 
     # Test SET_KEY
-    ser.write(b"SET_KEY:0:1:61\n")
-    time.sleep(0.2)
-    resp = ser.readline().decode("utf-8", errors="replace").strip()
+    resp = send_command(ser, "SET_KEY:0:1:61", on_event=report_async_event)
     ok = resp == "OK"
     results.append(("SET_KEY accepts valid command", ok, resp))
 
     # Verify change
-    ser.write(b"GET_LAYOUT\n")
-    time.sleep(0.2)
-    resp = ser.readline().decode("utf-8", errors="replace").strip()
+    resp = send_command(ser, "GET_LAYOUT", on_event=report_async_event)
     ok = resp.startswith("1:61")
     results.append(("SET_KEY persists change", ok, resp))
 
     # Reset
-    ser.write(b"SET_KEY:0:0:104\n")
-    time.sleep(0.2)
-    ser.readline()
+    send_command(ser, "SET_KEY:0:0:104", on_event=report_async_event)
 
     # Test invalid
-    ser.write(b"SET_KEY:99:0:0\n")
-    time.sleep(0.2)
-    resp = ser.readline().decode("utf-8", errors="replace").strip()
+    resp = send_command(ser, "SET_KEY:99:0:0", on_event=report_async_event)
     ok = resp.startswith("ERR")
     results.append(("SET_KEY rejects invalid index", ok, resp))
 

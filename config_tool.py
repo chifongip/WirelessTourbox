@@ -12,6 +12,8 @@ import time
 import termios
 import tty
 
+from serial_protocol import send_command
+
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
 BAUD = 115200
 
@@ -102,15 +104,8 @@ def format_mapping(mod, key):
 # --- Serial communication ---
 
 def send_cmd(ser, cmd):
-    """Send a command and return the response line, skipping KEY: events."""
-    ser.write((cmd + "\n").encode())
-    # Read lines, skipping KEY: events, until we get the actual response
-    for _ in range(20):  # max 20 attempts to avoid infinite loop
-        time.sleep(0.05)
-        line = ser.readline().decode("utf-8", errors="replace").strip()
-        if line and not line.startswith("KEY:"):
-            return line
-    return ""
+    """Send a command and return its matching response line."""
+    return send_command(ser, cmd)
 
 
 def get_layout(ser):

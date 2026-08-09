@@ -376,12 +376,12 @@ void pressSwitch(uint8_t switchSlot) {
 
 void releaseSwitch(uint8_t switchSlot) {
     uint8_t input = switches[switchSlot].index;
+    uint8_t activeLayer = layerState.currentLayer();
     tourbox::LayerRelease release = layerState.release(input);
     if (release == tourbox::LayerRelease::Tap) {
         enqueuePulse(input, mappings[0][input]);
     } else if (release == tourbox::LayerRelease::Deactivated) {
-        uint8_t layer = layerForTrigger(input);
-        logLayer(layer, false);
+        logLayer(activeLayer, false);
     } else if (switchActive[switchSlot]) {
         switchActive[switchSlot] = false;
         reportDirty = true;
@@ -613,9 +613,18 @@ void processCommand(const char* cmd) {
         else if (!validTrigger(trigger)) Serial.println("ERR:INELIGIBLE");
         else if (duplicateTrigger(layer - 1, trigger)) Serial.println("ERR:DUPLICATE");
         else {
-            if (layerTriggers[layer - 1] == tourbox::NO_TRIGGER) memset(mappings[layer], 0, sizeof(mappings[layer]));
-            layerTriggers[layer - 1] = trigger;
-            saveConfig();
+            uint8_t slot = static_cast<uint8_t>(layer - 1);
+            uint8_t nextTrigger = static_cast<uint8_t>(trigger);
+            bool wasUnused = layerTriggers[slot] == tourbox::NO_TRIGGER;
+            if (tourbox::updateConfigValue(layerTriggers[slot], nextTrigger)) {
+                if (layerState.clearLayer(static_cast<uint8_t>(layer))) {
+                    logLayer(static_cast<uint8_t>(layer), false);
+                }
+                if (wasUnused) {
+                    memset(mappings[layer], 0, sizeof(mappings[layer]));
+                }
+                saveConfig();
+            }
             Serial.println("OK");
         }
     } else if (strncmp(cmd, "REMOVE_LAYER:", 13) == 0) {
@@ -624,15 +633,15 @@ void processCommand(const char* cmd) {
         if (sscanf(cmd + 13, "%d%c", &layer, &trailing) != 1) Serial.println("ERR:PARSE");
         else if (layer < 1 || layer > tourbox::MAX_LAYERS) Serial.println("ERR:RANGE");
         else {
-            if (layerState.currentLayer() == layer) {
-                logLayer(layer, false);
-                layerState.reset();
-            } else if (layerState.pendingLayer() == layer) {
-                layerState.reset();
+            uint8_t slot = static_cast<uint8_t>(layer - 1);
+            if (tourbox::updateConfigValue(layerTriggers[slot],
+                                           tourbox::NO_TRIGGER)) {
+                if (layerState.clearLayer(static_cast<uint8_t>(layer))) {
+                    logLayer(static_cast<uint8_t>(layer), false);
+                }
+                memset(mappings[layer], 0, sizeof(mappings[layer]));
+                saveConfig();
             }
-            layerTriggers[layer - 1] = tourbox::NO_TRIGGER;
-            memset(mappings[layer], 0, sizeof(mappings[layer]));
-            saveConfig();
             Serial.println("OK");
         }
     } else if (strncmp(cmd, "SET_HOLD_MS:", 12) == 0) {
@@ -641,8 +650,10 @@ void processCommand(const char* cmd) {
         if (sscanf(cmd + 12, "%d%c", &value, &trailing) != 1) Serial.println("ERR:PARSE");
         else if (value < MIN_HOLD_MS || value > MAX_HOLD_MS) Serial.println("ERR:RANGE");
         else {
-            holdMs = value;
-            saveConfig();
+            uint16_t nextHoldMs = static_cast<uint16_t>(value);
+            if (tourbox::updateConfigValue(holdMs, nextHoldMs)) {
+                saveConfig();
+            }
             Serial.println("OK");
         }
     } else {
